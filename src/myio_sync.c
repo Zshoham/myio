@@ -262,6 +262,19 @@ static void impl_task_free(myio *io, myio_task *task) {
     free(task);
 }
 
+static void impl_task_detach(myio *io, myio_task *task) {
+    (void)io;
+    sync_task *t = task_of(task);
+    /* Every task is complete by now; discarding the result means a socket
+     * it won must be closed here, or it would leak. */
+    if (t->res.ptr) {
+        sync_sock *s = t->res.ptr;
+        close(s->fd);
+        free(s);
+    }
+    free(t);
+}
+
 static void impl_destroy(myio *io) {
     free(io);
 }
@@ -285,6 +298,7 @@ static const myio_ops sync_ops = {
     .select      = impl_select,
     .task_done   = impl_task_done,
     .task_free   = impl_task_free,
+    .task_detach = impl_task_detach,
     .destroy     = impl_destroy,
 };
 

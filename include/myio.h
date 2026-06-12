@@ -40,9 +40,14 @@
  * Task handles are owned by the caller and must be released with
  * `myio_task_free()`. Awaiting does not free the task, so a result may be
  * re-read and tasks may appear in several `select` calls. Freeing a task
- * that is still in flight is allowed; the backend cancels it or waits for
- * it as needed. `myio_join()` awaits and frees in one step - use it
- * whenever the result is needed exactly once.
+ * that is still in flight is allowed but may block: the in-flight operation
+ * references the task's memory (and the caller's buffers), so the backend
+ * requests cancellation where it can and then waits until the operation
+ * completes or can be stopped. `myio_task_detach()` is the non-blocking
+ * alternative for "I don't care anymore": ownership passes to the backend,
+ * which frees the task when it completes and discards its result (closing
+ * a socket the task may win). `myio_join()` awaits and frees in one step -
+ * use it whenever the result is needed exactly once.
  *
  * Threading: a `myio` instance and its tasks must be driven from a single
  * thread (the backend itself may use threads internally).
@@ -129,6 +134,7 @@ typedef struct myio_ops {
     /* Task and instance lifetime. */
     int  (*task_done)(myio *io, const myio_task *task);   /* non-blocking poll */
     void (*task_free)(myio *io, myio_task *task);
+    void (*task_detach)(myio *io, myio_task *task);       /* free on completion */
     void (*destroy)(myio *io);
 } myio_ops;
 
@@ -268,13 +274,33 @@ static inline int myio_task_done(myio *io, const myio_task *task) {
     return io->ops->task_done(io, task);
 }
 
-/* No-op on NULL, so results of failed submissions can be freed blindly. */
+/* Release a task handle. If the task is still in flight this may block:
+ * cancellation is requested where possible, and the call then waits until
+ * the operation completes or stops referencing the task and the caller's
+ * buffers. Prefer myio_task_detach() when the result no longer matters.
+ * No-op on NULL, so results of failed submissions can be freed blindly. */
 static inline void myio_task_free(myio *io, myio_task *task) {
     if (task)
         io->ops->task_free(io, task);
 }
 
-/* Release the instance. Outstanding tasks should be freed first. */
+/* Relinquish ownership of a task without waiting for it (fire and forget).
+ * The backend frees the task when it completes - immediately if it already
+ * has - and the handle is invalid as soon as this returns. The result is
+ * discarded: if the task wins a socket (tcp_connect/tcp_accept), the
+ * backend closes it, even when the task had already completed and the
+ * result was read. Detaching does not cancel; call myio_cancel() first to
+ * also request that the operation stop. Buffers passed to a detached
+ * operation must stay valid until the instance is destroyed, since the
+ * caller can no longer learn when the operation finishes. No-op on NULL. */
+static inline void myio_task_detach(myio *io, myio_task *task) {
+    if (task)
+        io->ops->task_detach(io, task);
+}
+
+/* Release the instance. Caller-owned tasks should be freed first; detached
+ * tasks are finished or abandoned by the backend (which may block until
+ * their operations can be stopped or complete). */
 static inline void myio_destroy(myio *io) {
     io->ops->destroy(io);
 }
@@ -334,8 +360,9 @@ static inline myio_result myio_await_timeout(myio *io, myio_task *task,
             myio_result r = { MYIO_PENDING, 0, 0, NULL };
             return r;
         }
+        /* The task won: the still-ticking timer is of no further interest. */
         io->ops->cancel(io, timer);
-        io->ops->task_free(io, timer);
+        io->ops->task_detach(io, timer);
     }
     return io->ops->await(io, task);
 }

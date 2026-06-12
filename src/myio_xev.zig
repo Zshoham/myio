@@ -60,6 +60,7 @@ const Ops = extern struct {
     select: *const fn (*Myio, [*]?*MyioTask, usize) callconv(.c) isize,
     task_done: *const fn (*Myio, *const MyioTask) callconv(.c) c_int,
     task_free: *const fn (*Myio, *MyioTask) callconv(.c) void,
+    task_detach: *const fn (*Myio, *MyioTask) callconv(.c) void,
     destroy: *const fn (*Myio) callconv(.c) void,
 };
 
@@ -132,13 +133,17 @@ fn Backend(comptime xev: type) type {
             loop: xev.Loop,
             pool: xevpkg.ThreadPool,
             socks: ?*Sock, // every live socket, for teardown in destroy
+            reap: ?*Task, // detached tasks that finished, awaiting reclaim
+            detached_live: usize, // detached tasks not yet reclaimed
         };
 
         const Task = struct {
             io: *Io,
             kind: Kind,
             done: bool = false,
+            detached: bool = false, // free on completion, result discarded
             res: Result = .{},
+            rnext: ?*Task = null, // io's reap list
 
             c: xev.Completion = .{}, // the operation itself
             c_cancel: xev.Completion = .{}, // cancellation requests
@@ -210,18 +215,70 @@ fn Backend(comptime xev: type) type {
         fn completeOk(t: *Task, value: i64) void {
             t.res.status = .ok;
             t.res.value = value;
-            t.done = true;
+            finish(t);
         }
 
         fn completeErr(t: *Task, errno: c_int) void {
             t.res.status = .err;
             t.res.err = errno;
-            t.done = true;
+            finish(t);
         }
 
         fn completeCanceled(t: *Task) void {
             t.res.status = .canceled;
+            finish(t);
+        }
+
+        /// Every completion ends here. A detached task's result is never
+        /// observable, so a socket it won is closed, and the task joins the
+        /// reap list; it is actually freed between loop ticks, once none of
+        /// its completions are referenced by the loop anymore.
+        fn finish(t: *Task) void {
             t.done = true;
+            if (!t.detached) return;
+            discardResult(t);
+            t.rnext = t.io.reap;
+            t.io.reap = t;
+        }
+
+        /// Close the socket a detached connect/accept won; nobody will
+        /// claim it. Loop-sequenced, since this may run inside a completion
+        /// callback whose fd is still registered.
+        fn discardResult(t: *Task) void {
+            const p = t.res.ptr orelse return;
+            t.res.ptr = null;
+            sockDiscardAsync(@ptrCast(@alignCast(p)));
+        }
+
+        /// True once the loop and thread pool hold no reference to the
+        /// task's memory, making it safe to free.
+        fn taskIdle(t: *const Task) bool {
+            return !t.pool_pending and t.c.state() == .dead and
+                t.c_cancel.state() == .dead and t.c_async.state() == .dead;
+        }
+
+        /// Release a task's memory and owned inputs.
+        fn taskDestroy(io: *Io, t: *Task) void {
+            if (t.detached) io.detached_live -= 1;
+            if (t.has_notifier) t.notifier.deinit();
+            if (t.path) |p| alloc.free(p);
+            if (t.host) |h| alloc.free(h);
+            alloc.destroy(t);
+        }
+
+        /// Free finished detached tasks whose completions have settled.
+        /// Called between loop ticks (never from inside a callback, where
+        /// the loop may still touch the completion that fired).
+        fn reapDetached(io: *Io) void {
+            var p = &io.reap;
+            while (p.*) |t| {
+                if (taskIdle(t)) {
+                    p.* = t.rnext;
+                    taskDestroy(io, t);
+                } else {
+                    p = &t.rnext;
+                }
+            }
         }
 
         /// Ask the loop to cancel `target`. On io_uring its callback then
@@ -931,6 +988,7 @@ fn Backend(comptime xev: type) type {
                     completeErr(t, eint(E.IO));
                     break;
                 };
+                reapDetached(io);
                 if (!t.done and loopDrained(io)) {
                     // Loop has nothing left to do; the task can never
                     // complete.
@@ -990,6 +1048,7 @@ fn Backend(comptime xev: type) type {
                 }
                 if (!any) return -1;
                 io.loop.run(.once) catch return -1;
+                reapDetached(io);
                 if (loopDrained(io)) {
                     for (tasks[0..ntasks], 0..) |h, i|
                         if (h != null and taskOf(h.?).done) return @intCast(i);
@@ -1017,22 +1076,43 @@ fn Backend(comptime xev: type) type {
             // A done task may still have loop completions in flight (e.g. a
             // cancellation that was just submitted); drain them so nothing
             // dangles into freed memory.
-            while (t.pool_pending or
-                t.c.state() == .active or
-                t.c_cancel.state() == .active or
-                t.c_async.state() == .active)
-            {
+            while (!taskIdle(t)) {
                 if (loopDrained(io)) break;
                 io.loop.run(.once) catch break;
+                reapDetached(io);
             }
-            if (t.has_notifier) t.notifier.deinit();
-            if (t.path) |p| alloc.free(p);
-            if (t.host) |h| alloc.free(h);
-            alloc.destroy(t);
+            taskDestroy(io, t);
+        }
+
+        fn implTaskDetach(m: *Myio, task: *MyioTask) callconv(.c) void {
+            const io = ioOf(m);
+            const t = taskOf(task);
+            t.detached = true;
+            io.detached_live += 1;
+            if (!t.done) return; // finish() queues it for reaping
+            // Already complete: discard the result now and reclaim the
+            // memory as soon as the loop lets go of its completions.
+            discardResult(t);
+            if (taskIdle(t)) {
+                taskDestroy(io, t);
+            } else {
+                t.rnext = io.reap;
+                io.reap = t;
+            }
         }
 
         fn implDestroy(m: *Myio) callconv(.c) void {
             const io = ioOf(m);
+            // Detached tasks must not outlive the instance: drive the loop
+            // until each completes and its completions settle. May block
+            // until their operations can be stopped or complete (as
+            // documented for myio_destroy).
+            reapDetached(io);
+            while (io.detached_live > 0) {
+                if (loopDrained(io)) break; // leak rather than free live memory
+                io.loop.run(.once) catch break;
+                reapDetached(io);
+            }
             // Reclaim sockets that were never closed (the listener of a
             // crashed-out program, say); their fds would otherwise leak.
             while (io.socks) |s| {
@@ -1065,6 +1145,7 @@ fn Backend(comptime xev: type) type {
             .select = implSelect,
             .task_done = implTaskDone,
             .task_free = implTaskFree,
+            .task_detach = implTaskDetach,
             .destroy = implDestroy,
         };
 
@@ -1075,6 +1156,8 @@ fn Backend(comptime xev: type) type {
                 .loop = undefined,
                 .pool = xevpkg.ThreadPool.init(.{}),
                 .socks = null,
+                .reap = null,
+                .detached_live = 0,
             };
             io.loop = xev.Loop.init(.{ .thread_pool = &io.pool }) catch {
                 io.pool.shutdown();

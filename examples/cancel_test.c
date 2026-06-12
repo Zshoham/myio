@@ -149,6 +149,34 @@ int main(int argc, char **argv) {
     if (myio_ok(ar3) && ar3.ptr)
         myio_join(io, myio_sock_close(io, ar3.ptr));
 
+    /* Detach: fire and forget. The backend frees detached tasks when they
+     * complete and closes any socket they win - the fd check at the end
+     * would catch a leak in either direction. */
+    myio_task *da = myio_tcp_accept(io, ls);
+    myio_task *dc = myio_tcp_connect(io, "127.0.0.1", port);
+    myio_task_detach(io, da);
+    myio_task_detach(io, dc);
+    myio_join(io, myio_sleep(io, 50)); /* let both complete unobserved */
+    expect(1, "detached connect/accept completed unobserved");
+
+    /* Detaching an already completed task discards its result too. */
+    myio_task *dc2 = myio_tcp_connect(io, "127.0.0.1", port);
+    myio_task *da2 = myio_tcp_accept(io, ls);
+    myio_join(io, myio_sleep(io, 50));
+    expect(myio_task_done(io, dc2) && myio_task_done(io, da2),
+           "second detach pair completed");
+    myio_task_detach(io, dc2);
+    myio_task_detach(io, da2);
+
+    /* Cancel + detach: drop a pending read without waiting for it. The
+     * read stays outstanding (it holds the socket's one-read slot) until
+     * the backend has processed the cancellation, so give the loop a turn
+     * before reading from the socket again. */
+    myio_task *rd3 = myio_sock_read(io, server, buf, sizeof buf);
+    myio_cancel(io, rd3);
+    myio_task_detach(io, rd3);
+    myio_join(io, myio_sleep(io, 10));
+
     /* sock_close cancels outstanding reads and accepts on the socket. */
     myio_task *rd2 = myio_sock_read(io, server, buf, sizeof buf);
     myio_task *acc2 = myio_tcp_accept(io, ls);

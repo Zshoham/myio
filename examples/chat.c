@@ -53,17 +53,16 @@ static uint64_t retry_ms(void) {
     return e ? (uint64_t)atoi(e) : 10000;
 }
 
-/* Retire a pending establishment task (accept/connect/sleep). If it lost a
- * race and already completed with a socket, that socket must be closed,
- * not leaked. */
+/* Retire a pending establishment task (accept/connect/sleep): request
+ * cancellation and detach. If the task lost the race and completes with a
+ * socket anyway, the backend closes it - that's exactly what detaching an
+ * unclaimed result means. */
 static void drop_task(chat *c, myio_task **pt) {
     if (!*pt)
         return;
     myio_cancel(c->io, *pt);
-    myio_result r = myio_join(c->io, *pt);
+    myio_task_detach(c->io, *pt);
     *pt = NULL;
-    if (myio_ok(r) && r.ptr)
-        myio_join(c->io, myio_sock_close(c->io, r.ptr));
 }
 
 static void become_connected(chat *c, myio_sock *peer) {
@@ -87,7 +86,7 @@ static void go_disconnected(chat *c) {
 static void disconnect_peer(chat *c) {
     if (c->tnet) {
         myio_cancel(c->io, c->tnet);
-        myio_task_free(c->io, c->tnet);
+        myio_task_detach(c->io, c->tnet);
         c->tnet = NULL;
     }
     if (c->peer) {
@@ -225,9 +224,9 @@ int main(int argc, char **argv) {
 
     if (c.tin) {
         /* The pending stdin read is a blocking read() parked on the uv
-         * thread pool; it cannot be canceled, and tearing down the loop
-         * would wait for one more line of input. Let process exit reclaim
-         * everything instead. */
+         * thread pool; it cannot be canceled, and even detached,
+         * myio_destroy would block on it until one more line of input
+         * arrives. Let process exit reclaim everything instead. */
         _exit(0);
     }
     drop_task(&c, &c.taccept);

@@ -31,6 +31,7 @@ typedef struct uv_task {
     uv_io          *io;
     enum task_kind  kind;
     int             done;
+    int             detached;   /* free on completion, result discarded */
     myio_result     res;
     uv_buf_t        buf;        /* keeps the iov alive for read/write */
     uv_sock        *sock;       /* socket the task operates on, if any */
@@ -79,6 +80,34 @@ static uv_task *task_new(uv_io *io, enum task_kind kind) {
     return t;
 }
 
+static void sock_destroy(uv_sock *s);
+static void timer_close_cb(uv_handle_t *h);
+
+/* Free a detached task that has completed. Its result is discarded, so a
+ * socket it won is closed here - no caller will ever claim it. */
+static void task_reap(uv_task *t) {
+    if (t->res.ptr)
+        sock_destroy(t->res.ptr);
+    if (t->kind == TASK_TIMER && !t->timer_closed) {
+        /* The timer handle lives inside the task; it must finish closing
+         * before the memory can go. */
+        t->free_on_close = 1;
+        if (!uv_is_closing((uv_handle_t *)&t->u.timer))
+            uv_close((uv_handle_t *)&t->u.timer, timer_close_cb);
+        return;
+    }
+    free(t);
+}
+
+/* Every completion ends here: marks the task done and, when it has been
+ * detached, frees it on the spot (safe: a libuv request's callback is its
+ * final event, so nothing references the task afterwards). */
+static void task_finish(uv_task *t) {
+    t->done = 1;
+    if (t->detached)
+        task_reap(t);
+}
+
 static void task_complete(uv_task *t, int64_t uv_result) {
     if (uv_result >= 0) {
         t->res.status = MYIO_OK;
@@ -91,7 +120,7 @@ static void task_complete(uv_task *t, int64_t uv_result) {
          * use libuv's own UV_EAI_* range). */
         t->res.error = (int)-uv_result;
     }
-    t->done = 1;
+    task_finish(t);
 }
 
 /* A task that failed before it could even be submitted. */
@@ -118,9 +147,19 @@ static uv_sock *sock_new(uv_io *io) {
 }
 
 /* Final step of every socket's life: completes the close task if one is
- * attached, then releases the memory. */
+ * attached, then releases the memory. Outstanding pull tasks are normally
+ * canceled by impl_sock_close before this runs; completing them here too
+ * covers sockets torn down by destroy's walk. */
 static void sock_close_cb(uv_handle_t *h) {
     uv_sock *s = h->data;
+    if (s->read_task) {
+        task_complete(s->read_task, UV_ECANCELED);
+        s->read_task = NULL;
+    }
+    if (s->accept_task) {
+        task_complete(s->accept_task, UV_ECANCELED);
+        s->accept_task = NULL;
+    }
     if (s->close_task)
         task_complete(s->close_task, 0);
     free(s);
@@ -198,8 +237,10 @@ static void timer_close_cb(uv_handle_t *h) {
 
 static void timer_cb(uv_timer_t *timer) {
     uv_task *t = timer->data;
-    task_complete(t, 0);
+    /* Close first: task_complete may free a detached task, and reaping a
+     * timer relies on seeing the close already in progress. */
     uv_close((uv_handle_t *)timer, timer_close_cb);
+    task_complete(t, 0);
 }
 
 static myio_task *impl_sleep(myio *io, uint64_t ms) {
@@ -234,7 +275,7 @@ static void after_work_cb(uv_work_t *req, int status) {
          * task_complete's libuv-code interpretation. */
         t->res.status = MYIO_ERROR;
         t->res.error = (int)-t->fn_ret;
-        t->done = 1;
+        task_finish(t);
     }
 }
 
@@ -260,18 +301,18 @@ static void connect_cb(uv_connect_t *req, int status) {
         task_complete(t, 0);
         return;
     }
-    task_complete(t, status);
     sock_destroy(t->sock); /* no-op if a cancel already started the close */
     t->sock = NULL;
+    task_complete(t, status);
 }
 
 static void gai_cb(uv_getaddrinfo_t *req, int status, struct addrinfo *res) {
     uv_task *t = req->data;
     if (status < 0) {
-        task_complete(t, status);
         sock_destroy(t->sock);
         t->sock = NULL;
         uv_freeaddrinfo(res);
+        task_complete(t, status);
         return;
     }
     t->connecting = 1;
@@ -280,9 +321,9 @@ static void gai_cb(uv_getaddrinfo_t *req, int status, struct addrinfo *res) {
     int rc = uv_tcp_connect(&t->conn, &t->sock->tcp, res->ai_addr, connect_cb);
     uv_freeaddrinfo(res);
     if (rc < 0) {
-        task_complete(t, rc);
         sock_destroy(t->sock);
         t->sock = NULL;
+        task_complete(t, rc);
     }
 }
 
@@ -524,9 +565,8 @@ static int impl_cancel(myio *io, myio_task *task) {
     switch (t->kind) {
     case TASK_TIMER:
         uv_timer_stop(&t->u.timer);
-        t->res.status = MYIO_CANCELED;
-        t->done = 1;
         uv_close((uv_handle_t *)&t->u.timer, timer_close_cb);
+        task_complete(t, UV_ECANCELED);
         return 0;
     case TASK_FS:
         /* Succeeds only while the request is still queued on the thread
@@ -543,13 +583,11 @@ static int impl_cancel(myio *io, myio_task *task) {
     case TASK_SOCK_READ:
         uv_read_stop((uv_stream_t *)&t->sock->tcp);
         t->sock->read_task = NULL;
-        t->res.status = MYIO_CANCELED;
-        t->done = 1;
+        task_complete(t, UV_ECANCELED);
         return 0;
     case TASK_ACCEPT:
         t->sock->accept_task = NULL;
-        t->res.status = MYIO_CANCELED;
-        t->done = 1;
+        task_complete(t, UV_ECANCELED);
         return 0;
     default:
         return -1; /* writes and closes cannot be taken back */
@@ -601,14 +639,29 @@ static void impl_task_free(myio *io, myio_task *task) {
     free(t);
 }
 
+static void impl_task_detach(myio *io, myio_task *task) {
+    (void)io;
+    uv_task *t = task_of(task);
+    if (t->done)
+        task_reap(t);
+    else
+        t->detached = 1;
+}
+
 static void close_walk_cb(uv_handle_t *h, void *arg) {
     (void)arg;
     if (uv_is_closing(h))
         return;
     switch (h->type) {
-    case UV_TIMER:
+    case UV_TIMER: {
+        /* A detached sleep whose timer never fired is reclaimed through
+         * the close callback; an owned one stays for task_free. */
+        uv_task *t = h->data;
+        if (t->detached)
+            t->free_on_close = 1;
         uv_close(h, timer_close_cb);
         break;
+    }
     case UV_TCP:
         uv_close(h, sock_close_cb);
         break;
@@ -645,6 +698,7 @@ static const myio_ops uv_ops = {
     .select      = impl_select,
     .task_done   = impl_task_done,
     .task_free   = impl_task_free,
+    .task_detach = impl_task_detach,
     .destroy     = impl_destroy,
 };
 
