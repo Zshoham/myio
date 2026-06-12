@@ -12,6 +12,7 @@
 typedef struct {
     myio      base;
     uv_loop_t loop;
+    char      errbuf[128]; /* last myio_strerror rendering */
 } uv_io;
 
 enum task_kind {
@@ -116,8 +117,9 @@ static void task_complete(uv_task *t, int64_t uv_result) {
         t->res.status = MYIO_CANCELED;
     } else {
         t->res.status = MYIO_ERROR;
-        /* libuv error codes are negated errno values on POSIX (DNS failures
-         * use libuv's own UV_EAI_* range). */
+        /* Stored negated, so OS failures read as plain errnos while DNS
+         * failures keep libuv's own UV_EAI_* range; error_str undoes the
+         * negation and lets uv_strerror name either kind. */
         t->res.error = (int)-uv_result;
     }
     task_finish(t);
@@ -615,6 +617,13 @@ static ptrdiff_t impl_select(myio *io, myio_task **tasks, size_t ntasks) {
     }
 }
 
+static const char *impl_error_str(myio *io, int err) {
+    uv_io *u = io_of(io);
+    /* Codes were stored negated; -err is a libuv error code, which on POSIX
+     * also covers plain errnos (UV_ENOENT == -ENOENT and so on). */
+    return uv_strerror_r(-err, u->errbuf, sizeof u->errbuf);
+}
+
 /* ---- lifetime ---- */
 
 static int impl_task_done(myio *io, const myio_task *task) {
@@ -696,6 +705,7 @@ static const myio_ops uv_ops = {
     .await       = impl_await,
     .cancel      = impl_cancel,
     .select      = impl_select,
+    .error_str   = impl_error_str,
     .task_done   = impl_task_done,
     .task_free   = impl_task_free,
     .task_detach = impl_task_detach,

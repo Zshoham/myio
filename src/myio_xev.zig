@@ -58,6 +58,7 @@ const Ops = extern struct {
     @"await": *const fn (*Myio, *MyioTask) callconv(.c) Result,
     cancel: *const fn (*Myio, *MyioTask) callconv(.c) c_int,
     select: *const fn (*Myio, [*]?*MyioTask, usize) callconv(.c) isize,
+    error_str: *const fn (*Myio, c_int) callconv(.c) [*:0]const u8,
     task_done: *const fn (*Myio, *const MyioTask) callconv(.c) c_int,
     task_free: *const fn (*Myio, *MyioTask) callconv(.c) void,
     task_detach: *const fn (*Myio, *MyioTask) callconv(.c) void,
@@ -104,6 +105,16 @@ fn isCanceled(err: anyerror) bool {
 
 fn closeFd(fd: std.posix.fd_t) void {
     _ = std.os.linux.close(fd);
+}
+
+extern fn strerror(errnum: c_int) [*:0]const u8;
+extern fn gai_strerror(errcode: c_int) [*:0]const u8;
+
+/// Shared by every backend instantiation. Negative codes are getaddrinfo's
+/// EAI_* namespace, kept verbatim by the DNS stage; everything else is
+/// errno-style (including the codes errnoOf produces from Zig errors).
+fn implErrorStr(_: *Myio, err: c_int) callconv(.c) [*:0]const u8 {
+    return if (err < 0) gai_strerror(err) else strerror(err);
 }
 
 // === backend-generic implementation ====================================
@@ -406,12 +417,13 @@ fn Backend(comptime xev: type) type {
             var res: ?*std.c.addrinfo = null;
             const rc = std.c.getaddrinfo(t.host.?.ptr, service.ptr, &hints, &res);
             if (@intFromEnum(rc) != 0) {
-                t.pool_errno = switch (rc) {
-                    .NONAME, .NODATA => eint(E.NOENT),
-                    .AGAIN => eint(E.AGAIN),
-                    .MEMORY => eint(E.NOMEM),
-                    else => eint(E.IO),
-                };
+                // Resolver failures have no honest errno: keep the
+                // (negative) EAI_* code verbatim for implErrorStr, except
+                // EAI_SYSTEM, which says the real error is in errno.
+                t.pool_errno = if (rc == .SYSTEM)
+                    std.c._errno().*
+                else
+                    @intFromEnum(rc);
                 return;
             }
             defer std.c.freeaddrinfo(res.?);
@@ -1143,6 +1155,7 @@ fn Backend(comptime xev: type) type {
             .@"await" = implAwait,
             .cancel = implCancel,
             .select = implSelect,
+            .error_str = implErrorStr,
             .task_done = implTaskDone,
             .task_free = implTaskFree,
             .task_detach = implTaskDetach,

@@ -93,9 +93,9 @@ static myio_task *impl_spawn(myio *io, myio_fn fn, void *arg) {
 /* ---- TCP ---- */
 
 static int gai_errno(int rc) {
-    /* getaddrinfo has its own error namespace; collapse everything except
-     * EAI_SYSTEM into a generic errno-style resolution failure. */
-    return rc == EAI_SYSTEM ? errno : EHOSTUNREACH;
+    /* getaddrinfo has its own (negative) error namespace; keep it verbatim
+     * and let error_str render it honestly. EAI_SYSTEM defers to errno. */
+    return rc == EAI_SYSTEM ? errno : rc;
 }
 
 static myio_task *wrap_fd(int fd) {
@@ -251,6 +251,13 @@ static ptrdiff_t impl_select(myio *io, myio_task **tasks, size_t ntasks) {
     return -1;
 }
 
+static const char *impl_error_str(myio *io, int err) {
+    (void)io;
+    /* Negative codes are getaddrinfo's EAI_* range, kept verbatim by
+     * tcp_connect/tcp_listen; everything else is errno-style. */
+    return err < 0 ? gai_strerror(err) : strerror(err);
+}
+
 static int impl_task_done(myio *io, const myio_task *task) {
     (void)io;
     (void)task;
@@ -296,6 +303,7 @@ static const myio_ops sync_ops = {
     .await       = impl_await,
     .cancel      = impl_cancel,
     .select      = impl_select,
+    .error_str   = impl_error_str,
     .task_done   = impl_task_done,
     .task_free   = impl_task_free,
     .task_detach = impl_task_detach,

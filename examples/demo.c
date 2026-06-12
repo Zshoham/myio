@@ -20,7 +20,7 @@ static int64_t must(myio *io, myio_task *t, const char *what) {
     myio_result r = myio_join(io, t);
     if (!myio_ok(r)) {
         fprintf(stderr, "%s failed: status=%s error=%s\n", what,
-                myio_status_str(r.status), strerror(r.error));
+                myio_status_str(r.status), myio_strerror(io, r.error));
         exit(1);
     }
     return r.value;
@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
     int lerr = 0;
     myio_sock *ls = myio_tcp_listen(io, "127.0.0.1", 0, 16, &lerr);
     if (!ls) {
-        fprintf(stderr, "listen failed: %s\n", strerror(lerr));
+        fprintf(stderr, "listen failed: %s\n", myio_strerror(io, lerr));
         exit(1);
     }
     int port = myio_sock_port(io, ls);
@@ -155,6 +155,14 @@ int main(int argc, char **argv) {
     printf("server read after peer close: %lld bytes (EOF)\n", (long long)n);
     must(io, myio_sock_close(io, server), "close server conn");
     must(io, myio_sock_close(io, ls), "close listener");
+
+    /* 6. Errors keep their backend's native vocabulary: a DNS failure
+     *    renders as the real resolver error through myio_strerror() instead
+     *    of being squashed into some errno. */
+    myio_result dr = myio_join(io, myio_tcp_connect(io, "no.such.host.invalid",
+                                                    9));
+    printf("dns failure: status=%s error=\"%s\"\n", myio_status_str(dr.status),
+           myio_strerror(io, dr.error));
 
     remove("demo1.tmp");
     remove("demo2.tmp");

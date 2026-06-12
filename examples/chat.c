@@ -110,7 +110,8 @@ static int on_stdin(chat *c) {
                                                           c->inbuf,
                                                           (size_t)r.value));
         if (!myio_ok(wr)) {
-            fprintf(stderr, "* send failed: %s\n", strerror(wr.error));
+            fprintf(stderr, "* send failed: %s\n",
+                    myio_strerror(c->io, wr.error));
             disconnect_peer(c);
             go_disconnected(c);
         }
@@ -139,7 +140,8 @@ static void on_accept(chat *c) {
     myio_result r = myio_join(c->io, c->taccept);
     c->taccept = NULL;
     if (!myio_ok(r)) {
-        fprintf(stderr, "* accept failed: %s\n", strerror(r.error));
+        fprintf(stderr, "* accept failed: %s\n",
+                myio_strerror(c->io, r.error));
         c->taccept = myio_tcp_accept(c->io, c->listener);
         return;
     }
@@ -152,7 +154,7 @@ static void on_connect(chat *c) {
     if (!myio_ok(r)) {
         fprintf(stderr,
                 "* connect to %s:%d failed (%s), retrying in %llu ms\n",
-                c->host, c->peer_port, strerror(r.error),
+                c->host, c->peer_port, myio_strerror(c->io, r.error),
                 (unsigned long long)retry_ms());
         c->tsleep = myio_sleep(c->io, retry_ms());
         return;
@@ -190,7 +192,7 @@ int main(int argc, char **argv) {
     c.listener = myio_tcp_listen(c.io, "0.0.0.0", port, 1, &err);
     if (!c.listener) {
         fprintf(stderr, "* cannot listen on port %d: %s\n", port,
-                strerror(err));
+                myio_strerror(c.io, err));
         return 1;
     }
     fprintf(stderr, "* type messages; ctrl-d quits\n");

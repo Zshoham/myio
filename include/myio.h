@@ -77,7 +77,10 @@ typedef enum {
 typedef struct {
     myio_status status;
     int64_t     value;  /* op-dependent: fd for open, byte count for read/write */
-    int         error;  /* errno-style code, valid when status == MYIO_ERROR */
+    int         error;  /* error code, valid when status == MYIO_ERROR.
+                           Errno-style for OS errors, but backends may keep
+                           native ranges (DNS resolver codes, library codes):
+                           render with myio_strerror(), not strerror() */
     void       *ptr;    /* op-dependent handle: the myio_sock* delivered by
                            tcp_connect and tcp_accept, NULL otherwise */
 } myio_result;
@@ -130,6 +133,13 @@ typedef struct myio_ops {
     int         (*cancel)(myio *io, myio_task *task); /* 0 requested, -1 refused */
     ptrdiff_t   (*select)(myio *io, myio_task **tasks, size_t ntasks);
                                                   /* NULL entries are skipped */
+
+    /* Human-readable message for a result.error code. Codes are
+     * backend-defined, but plain (positive) errno values must always be
+     * understood: the helpers in this header produce them (e.g. ENOMEM in
+     * myio_join). The returned string stays valid at least until the next
+     * error_str call on this instance. */
+    const char *(*error_str)(myio *io, int error);
 
     /* Task and instance lifetime. */
     int  (*task_done)(myio *io, const myio_task *task);   /* non-blocking poll */
@@ -256,6 +266,13 @@ static inline myio_result myio_await(myio *io, myio_task *task) {
  * limit until then). */
 static inline int myio_cancel(myio *io, myio_task *task) {
     return io->ops->cancel(io, task);
+}
+
+/* Human-readable message for a result.error code, in the backend's native
+ * error vocabulary - e.g. a DNS resolution failure renders as the real
+ * resolver error instead of a squashed errno. Use instead of strerror(). */
+static inline const char *myio_strerror(myio *io, int error) {
+    return io->ops->error_str(io, error);
 }
 
 /* Block until at least one of `tasks` has completed; return the index of a
