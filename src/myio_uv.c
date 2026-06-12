@@ -193,6 +193,8 @@ static myio_task *impl_open(myio *io, const char *path, int flags, int mode) {
     if (!t)
         return NULL;
     t->u.fs.data = t;
+    /* uv_fs_open copies `path` into the request, which is what gives the
+     * header's "strings are copied by submit" guarantee. */
     return fs_submitted(t, uv_fs_open(&t->io->loop, &t->u.fs, path, flags,
                                       mode, fs_cb));
 }
@@ -345,6 +347,8 @@ static myio_task *impl_tcp_connect(myio *io, const char *host, int port) {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     t->u.gai.data = t;
+    /* uv_getaddrinfo copies `host` and `service`, which is what gives the
+     * header's "strings are copied by submit" guarantee. */
     int rc = uv_getaddrinfo(&t->io->loop, &t->u.gai, gai_cb, host, service,
                             &hints);
     if (rc < 0) {

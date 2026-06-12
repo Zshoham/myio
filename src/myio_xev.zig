@@ -169,7 +169,9 @@ fn Backend(comptime xev: type) type {
             pool_errno: c_int = 0,
             cancel_requested: bool = false, // honored at the next stage boundary
 
-            // Operation inputs (owned copies where the C strings could die).
+            // Operation inputs. The header promises submit copies `path`
+            // and `host`; libxev has no such convention, so they are duped
+            // here.
             path: ?[:0]u8 = null,
             open_flags: c_int = 0,
             open_mode: std.posix.mode_t = 0,

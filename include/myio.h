@@ -23,6 +23,12 @@
  *     myio_result ra = myio_await(io, a);   // both reads run concurrently
  *     myio_result rb = myio_await(io, b);
  *
+ * Data buffers handed to an operation must stay valid until the task
+ * completes. Strings are the exception: submit functions copy `path` and
+ * `host`, so the caller may free or reuse them as soon as the submit call
+ * returns (open and DNS resolution outlive the call by design, so every
+ * backend wants the copy anyway).
+ *
  * `myio_select()` blocks until at least one task of a set has completed and
  * returns its index; NULL entries are skipped, so a fixed array of "slots"
  * can be selected on directly. Combining an IO task with a `myio_sleep()`
@@ -153,7 +159,8 @@ struct myio {
 };
 
 /* Open a file; on success result.value is the file descriptor.
- * `flags`/`mode` use the platform's open(2) conventions (O_RDONLY etc.). */
+ * `flags`/`mode` use the platform's open(2) conventions (O_RDONLY etc.).
+ * `path` is copied; it need not outlive this call. */
 static inline myio_task *myio_open(myio *io, const char *path, int flags,
                                    int mode) {
     return io->ops->open(io, path, flags, mode);
@@ -201,7 +208,8 @@ static inline myio_task *myio_spawn(myio *io, myio_fn fn, void *arg) {
  */
 
 /* Connect to `host` (IP literal or hostname, resolved by the backend) on
- * `port`. On MYIO_OK, result.ptr is the connected `myio_sock *`. */
+ * `port`. On MYIO_OK, result.ptr is the connected `myio_sock *`.
+ * `host` is copied; it need not outlive this call. */
 static inline myio_task *myio_tcp_connect(myio *io, const char *host,
                                           int port) {
     return io->ops->tcp_connect(io, host, port);
