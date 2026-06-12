@@ -3,7 +3,8 @@
 A backend-agnostic asynchronous IO interface for C. Programs code against
 `include/myio.h` only; the IO mechanism (event loop, thread pool, coroutines,
 or plain blocking calls) is picked by constructing a concrete backend and can
-be swapped without touching program logic.
+be swapped without touching program logic. Three backends exist: libuv,
+libxev, and a blocking synchronous one.
 
 ## Model
 
@@ -49,6 +50,38 @@ Tasks are intentionally *not* freed by `await` (unlike Rust futures): results
 can be re-read, and tasks can appear in several selects. `myio_join()` is the
 one-shot form.
 
+## The libxev backend
+
+[libxev](https://github.com/mitchellh/libxev) (vendored at
+`vendor/libxev`, commit 9ce8e8e) is a completion-based event loop in Zig.
+Its official C bindings cover only the loop, timers and the thread pool -
+TCP and file IO exist only in the Zig API - so this backend is written in
+Zig (`src/myio_xev.zig`) directly against that API and exports
+`myio_xev_new()` with the C ABI; programs still include only C headers.
+
+Notes from the port, compared with the libuv backend:
+
+- **The myio task model fit without changes.** libxev is pull-style where
+  libuv is push-style, which actually matches myio better: `accept` and
+  socket reads are one-shot submissions, so the libuv backend's parked
+  connection queue and `read_start`/`read_stop` choreography disappear.
+- The implementation is generic over the libxev backend type and is
+  instantiated for both io_uring and epoll; `myio_xev_new()` picks io_uring
+  at runtime when the kernel (and any seccomp policy) allows it, else epoll.
+- libxev has no async `open(2)` and no async DNS, so those run as blocking
+  calls on libxev's thread pool, completing the task through an `xev.Async`
+  wakeup - the same trick libuv uses internally for both.
+- Cancellation differs per libxev backend: io_uring delivers
+  `error.Canceled` to the canceled completion's callback, epoll kills the
+  completion *silently* (no callback), and epoll cannot cancel
+  thread-pool-routed work at all (so file reads/writes refuse cancellation
+  there, like a blocking backend). myio's best-effort `cancel` contract
+  absorbs all three.
+- One libxev invariant shapes the code: a completion callback must not
+  synchronously `close()` an fd that is still registered with the loop
+  (epoll deregisters it *after* the callback returns). Failed connects are
+  therefore reclaimed with a loop-sequenced close, not `close(2)`.
+
 ## Chat comparison
 
 The persistent peer-to-peer chat is implemented four times with identical
@@ -86,7 +119,9 @@ Observations:
 |---|---|
 | `include/myio.h` | the interface (vtable + inline wrappers) |
 | `include/myio_uv.h`, `src/myio_uv.c` | libuv backend (`myio_uv_new`) |
+| `include/myio_xev.h`, `src/myio_xev.zig` | libxev backend (`myio_xev_new`), in Zig |
 | `include/myio_sync.h`, `src/myio_sync.c` | blocking single-threaded backend (`myio_sync_new`) |
+| `build.zig`, `vendor/libxev/` | build + vendored dependency of the libxev backend |
 | `examples/demo.c` | example exercising concurrency, select, cancel |
 | `examples/chat.c` | single-threaded async peer-to-peer terminal chat |
 | `examples/chat_uv.c` | the same chat in raw libuv (comparison) |
@@ -96,11 +131,17 @@ Observations:
 ## Build and run
 
 ```sh
-make            # builds ./demo and ./chat (requires libuv)
-make test       # runs the demo on both backends
+make            # builds ./demo and ./chat (requires libuv and zig >= 0.16)
+make test       # runs the demo on all three backends
 ./demo uv
+./demo xev
 ./demo sync
 ```
+
+The libxev backend is compiled into `zig-out/lib/libmyio_xev.a` by `zig
+build` (the Makefile does this automatically) and linked into the demo and
+the chat. `CHAT_BACKEND=xev ./chat ...` runs the chat on libxev instead of
+libuv; the two interoperate.
 
 The chat (`./chat <port> [host [peer-port]]`) always listens on its port and,
 when a host is given, also dials `host:peer-port`, retrying every 10 seconds

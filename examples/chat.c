@@ -23,6 +23,7 @@
  */
 #include "myio.h"
 #include "myio_uv.h"
+#include "myio_xev.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -177,7 +178,11 @@ int main(int argc, char **argv) {
     c.host = argc > 2 ? argv[2] : NULL;
     c.peer_port = argc > 3 ? atoi(argv[3]) : port;
 
-    c.io = myio_uv_new();
+    /* Backend swap point: CHAT_BACKEND=xev runs the same program on libxev
+     * instead of libuv. */
+    const char *backend = getenv("CHAT_BACKEND");
+    c.io = backend && strcmp(backend, "xev") == 0 ? myio_xev_new()
+                                                  : myio_uv_new();
     if (!c.io) {
         fprintf(stderr, "* failed to create io backend\n");
         return 1;

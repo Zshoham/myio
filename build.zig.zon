@@ -1,0 +1,15 @@
+.{
+    .name = .myio,
+    .version = "0.1.0",
+    .fingerprint = 0xda1a0f3a2210ba9c,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .libxev = .{ .path = "vendor/libxev" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "include",
+    },
+}
