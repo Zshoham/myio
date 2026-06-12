@@ -55,8 +55,14 @@
  * a socket the task may win). `myio_join()` awaits and frees in one step -
  * use it whenever the result is needed exactly once.
  *
- * Threading: a `myio` instance and its tasks must be driven from a single
- * thread (the backend itself may use threads internally).
+ * Threading and re-entrancy: a `myio` instance and its tasks must be driven
+ * from a single thread (the backend itself may use threads internally). The
+ * interface has no user-visible callbacks, so user code - and with it every
+ * vtable call - runs only between backend loop iterations, never from
+ * inside one. This is a guarantee backends may lean on: a submit, cancel,
+ * or free issued by the caller can never race with the backend's own
+ * completion processing, which permits cancellation and teardown orderings
+ * that would be unsound under re-entrancy.
  */
 #ifndef MYIO_H
 #define MYIO_H
@@ -110,7 +116,9 @@ static inline const char *myio_status_str(myio_status s) {
     return "invalid";
 }
 
-/* Backend vtable. Programs normally use the inline wrappers below instead. */
+/* Backend vtable. Programs normally use the inline wrappers below instead.
+ * Backends may assume none of these functions is ever invoked from inside a
+ * completion callback (the re-entrancy guarantee above). */
 typedef struct myio_ops {
     /* IO operations: start immediately, return a handle (NULL on OOM). */
     myio_task *(*open)(myio *io, const char *path, int flags, int mode);

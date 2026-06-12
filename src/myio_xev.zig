@@ -298,6 +298,12 @@ fn Backend(comptime xev: type) type {
         /// fires with error.Canceled; on epoll the completion is killed
         /// without a callback. `cb` runs when the cancellation itself has
         /// been processed. No-op if a cancellation is already in flight.
+        ///
+        /// Sound only because of the header's re-entrancy guarantee: vtable
+        /// calls happen between loop ticks, so the cancel op is enqueued
+        /// after its target (submissions are FIFO) and processed before the
+        /// next batch of events - the target verified active here cannot
+        /// complete before the cancellation reaches it.
         fn submitCancel(io: *Io, target: *xev.Completion, c_cancel: *xev.Completion, userdata: ?*anyopaque, cb: xev.Callback) void {
             if (c_cancel.state() == .active) return;
             if (target.state() != .active) return;
