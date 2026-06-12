@@ -1,0 +1,9 @@
+# build artifacts
+/demo
+/chat
+/chat_uv
+/cancel_test
+*.tmp
+.zig-cache/
+zig-out/
+compile_commands.json
