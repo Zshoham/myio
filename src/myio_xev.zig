@@ -151,6 +151,7 @@ fn Backend(comptime xev: type) type {
             pool_pending: bool = false, // pool stage still owns the task
             pool_value: i64 = 0,
             pool_errno: c_int = 0,
+            cancel_requested: bool = false, // honored at the next stage boundary
 
             // Operation inputs (owned copies where the C strings could die).
             path: ?[:0]u8 = null,
@@ -236,6 +237,40 @@ fn Backend(comptime xev: type) type {
                 .callback = cb,
             };
             io.loop.add(c_cancel);
+        }
+
+        /// Runs when a cancellation submitted for `t.c` has been processed.
+        /// On io_uring the canceled operation's own callback fires with
+        /// error.Canceled (or with its normal result if the cancel lost the
+        /// race) and reports the task's fate, so there is nothing to do
+        /// here. On epoll a killed completion's callback never runs: the
+        /// task must be completed here, and whatever the dead completion
+        /// still held must be released - the fd the epoll backend dup(2)ed
+        /// for every TCP completion, and the half-made socket of a connect.
+        fn cancelDoneCb(
+            ud: ?*anyopaque,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.Result,
+        ) xev.CallbackAction {
+            if (comptime xev.backend == .epoll) {
+                const t: *Task = @ptrCast(@alignCast(ud.?));
+                if (t.c.flags.dup) closeFd(t.c.flags.dup_fd);
+                if (t.sock) |s| {
+                    switch (t.kind) {
+                        .sock_read => s.read_task = null,
+                        .accept => s.accept_task = null,
+                        .sock_write => writeListRemove(s, t),
+                        // The fd was deregistered when the completion was
+                        // killed, so it can be closed synchronously.
+                        .connect => sockDiscard(t.io, s),
+                        else => {},
+                    }
+                    t.sock = null;
+                }
+                if (!t.done) completeCanceled(t);
+            }
+            return .disarm;
         }
 
         fn sockListAdd(io: *Io, s: *Sock) void {
@@ -390,8 +425,12 @@ fn Backend(comptime xev: type) type {
                         completeErr(t, @intCast(-t.pool_value));
                 },
                 .connect => {
-                    if (t.done) return .disarm; // canceled during DNS
-                    if (t.pool_errno != 0)
+                    if (t.done) return .disarm;
+                    if (t.cancel_requested) {
+                        // Canceled while the DNS lookup was in flight; the
+                        // lookup result is simply discarded.
+                        completeCanceled(t);
+                    } else if (t.pool_errno != 0)
                         completeErr(t, t.pool_errno)
                     else
                         startConnect(t);
@@ -461,7 +500,7 @@ fn Backend(comptime xev: type) type {
             r: xev.ReadError!usize,
         ) xev.CallbackAction {
             const t = ud.?;
-            if (t.done) return .disarm; // canceled (io_uring only)
+            if (t.done) return .disarm; // completed elsewhere (loop failure)
             if (r) |n| completeOk(t, @intCast(n)) else |err| {
                 if (err == error.EOF)
                     completeOk(t, 0)
@@ -530,7 +569,7 @@ fn Backend(comptime xev: type) type {
             r: xev.Timer.RunError!void,
         ) xev.CallbackAction {
             const t = ud.?;
-            if (t.done) return .disarm; // canceled synchronously
+            if (t.done) return .disarm; // completed elsewhere (loop failure)
             if (r) |_| completeOk(t, 0) else |err| {
                 if (isCanceled(err))
                     completeCanceled(t)
@@ -596,23 +635,6 @@ fn Backend(comptime xev: type) type {
             s.tcp.connect(&io.loop, &t.c, t.addr, Task, t, connectCb);
         }
 
-        /// Runs when the cancellation of an in-flight connect has been
-        /// processed; whichever of this and connectCb runs second finds
-        /// t.sock already null.
-        fn connectCancelCb(
-            ud: ?*anyopaque,
-            _: *xev.Loop,
-            _: *xev.Completion,
-            _: xev.Result,
-        ) xev.CallbackAction {
-            const t: *Task = @ptrCast(@alignCast(ud.?));
-            if (t.sock) |s| {
-                t.sock = null;
-                sockDiscard(t.io, s);
-            }
-            return .disarm;
-        }
-
         fn connectCb(
             ud: ?*Task,
             _: *xev.Loop,
@@ -621,7 +643,7 @@ fn Backend(comptime xev: type) type {
             r: xev.ConnectError!void,
         ) xev.CallbackAction {
             const t = ud.?;
-            if (t.done) { // canceled mid-handshake: nobody wants the socket
+            if (t.done) { // completed elsewhere: nobody wants the socket
                 if (t.sock) |s| {
                     t.sock = null;
                     sockDiscard(t.io, s);
@@ -630,6 +652,7 @@ fn Backend(comptime xev: type) type {
             }
             if (r) |_| {
                 t.res.ptr = t.sock;
+                t.sock = null; // the caller owns it now
                 completeOk(t, 0);
             } else |err| {
                 const s = t.sock.?;
@@ -688,23 +711,6 @@ fn Backend(comptime xev: type) type {
             return handleOf(t);
         }
 
-        /// Runs when the cancellation of an accept has been processed. The
-        /// epoll backend dup(2)s the listener fd per accept completion and
-        /// only closes the dup when the accept fires normally; a canceled
-        /// accept would leak it.
-        fn acceptCancelCb(
-            ud: ?*anyopaque,
-            _: *xev.Loop,
-            _: *xev.Completion,
-            _: xev.Result,
-        ) xev.CallbackAction {
-            if (comptime xev.backend == .epoll) {
-                const t: *Task = @ptrCast(@alignCast(ud.?));
-                if (t.c.flags.dup) closeFd(t.c.flags.dup_fd);
-            }
-            return .disarm;
-        }
-
         fn acceptCb(
             ud: ?*Task,
             _: *xev.Loop,
@@ -712,7 +718,7 @@ fn Backend(comptime xev: type) type {
             r: xev.AcceptError!xev.TCP,
         ) xev.CallbackAction {
             const t = ud.?;
-            if (t.done) { // canceled; a connection that raced in is dropped
+            if (t.done) { // listener closed; a racing connection is dropped
                 if (r) |conn| closeFd(conn.fd) else |_| {}
                 return .disarm;
             }
@@ -767,7 +773,7 @@ fn Backend(comptime xev: type) type {
             r: xev.ReadError!usize,
         ) xev.CallbackAction {
             const t = ud.?;
-            if (t.done) return .disarm; // canceled / socket closed
+            if (t.done) return .disarm; // socket closed under it
             if (t.sock) |s| {
                 s.read_task = null;
                 t.sock = null;
@@ -819,7 +825,7 @@ fn Backend(comptime xev: type) type {
             r: xev.WriteError!usize,
         ) xev.CallbackAction {
             const t = ud.?;
-            if (t.done) return .disarm; // canceled / socket closed
+            if (t.done) return .disarm; // socket closed under it
             if (r) |n| {
                 // myio_sock_write queues the whole buffer: continue from
                 // where a partial send stopped.
@@ -852,26 +858,28 @@ fn Backend(comptime xev: type) type {
                 return taskFailed(io, .sock_close, eint(E.BUSY));
             const t = taskNew(io, .sock_close) orelse return null;
             // Outstanding pull-style tasks would otherwise never complete.
-            // They are detached and reported canceled right away; the cancel
-            // requests below just reap their loop completions.
+            // They are detached and reported canceled right away (the
+            // header promises sock_close cancels them); the cancel requests
+            // below reap their loop completions, and cancelDoneCb releases
+            // whatever the killed completions still held.
             if (s.read_task) |rt| {
                 s.read_task = null;
                 rt.sock = null;
                 completeCanceled(rt);
-                submitCancel(io, &rt.c, &rt.c_cancel, null, xev.noopCallback);
+                submitCancel(io, &rt.c, &rt.c_cancel, rt, cancelDoneCb);
             }
             if (s.accept_task) |at| {
                 s.accept_task = null;
                 at.sock = null;
                 completeCanceled(at);
-                submitCancel(io, &at.c, &at.c_cancel, at, acceptCancelCb);
+                submitCancel(io, &at.c, &at.c_cancel, at, cancelDoneCb);
             }
             while (s.writes) |wt| {
                 s.writes = wt.wnext;
                 wt.wnext = null;
                 wt.sock = null;
                 completeCanceled(wt);
-                submitCancel(io, &wt.c, &wt.c_cancel, null, xev.noopCallback);
+                submitCancel(io, &wt.c, &wt.c_cancel, wt, cancelDoneCb);
             }
             s.close_task = t;
             t.sock = s;
@@ -938,43 +946,30 @@ fn Backend(comptime xev: type) type {
             if (t.done) return -1;
             switch (t.kind) {
                 .timer => {
-                    completeCanceled(t);
-                    t.timer.cancel(&io.loop, &t.c, &t.c_cancel, void, null, timerCancelCb);
+                    // The timer's own callback fires with error.Canceled on
+                    // both backends (epoll special-cases timers) and reports
+                    // the outcome.
+                    if (t.c_cancel.state() != .active)
+                        t.timer.cancel(&io.loop, &t.c, &t.c_cancel, void, null, timerCancelCb);
                     return 0;
                 },
-                .sock_read => {
-                    if (t.sock) |s| {
-                        s.read_task = null;
-                        t.sock = null;
-                    }
-                    completeCanceled(t);
-                    submitCancel(io, &t.c, &t.c_cancel, null, xev.noopCallback);
-                    return 0;
-                },
-                .accept => {
-                    if (t.sock) |s| {
-                        s.accept_task = null;
-                        t.sock = null;
-                    }
-                    completeCanceled(t);
-                    submitCancel(io, &t.c, &t.c_cancel, t, acceptCancelCb);
+                .sock_read, .accept => {
+                    submitCancel(io, &t.c, &t.c_cancel, t, cancelDoneCb);
                     return 0;
                 },
                 .connect => {
-                    // DNS stage: the lookup itself cannot be stopped, but its
-                    // result is discarded in poolDoneCb. Connect stage: the
-                    // half-made socket is reclaimed once the cancellation has
-                    // been processed (on epoll a canceled completion's own
-                    // callback never runs, so connectCb cannot do it).
-                    completeCanceled(t);
-                    if (!t.pool_pending)
-                        submitCancel(io, &t.c, &t.c_cancel, t, connectCancelCb);
+                    if (t.pool_pending)
+                        // DNS stage: the lookup itself cannot be stopped;
+                        // the request is honored when it finishes
+                        // (poolDoneCb).
+                        t.cancel_requested = true
+                    else
+                        submitCancel(io, &t.c, &t.c_cancel, t, cancelDoneCb);
                     return 0;
                 },
                 .file_rw => {
                     if (!file_cancelable) return -1;
-                    completeCanceled(t);
-                    submitCancel(io, &t.c, &t.c_cancel, null, xev.noopCallback);
+                    submitCancel(io, &t.c, &t.c_cancel, t, cancelDoneCb);
                     return 0;
                 },
                 // open/spawn already run on the pool; writes and closes

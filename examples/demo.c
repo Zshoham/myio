@@ -97,11 +97,13 @@ int main(int argc, char **argv) {
     myio_task_free(io, rt);
     must(io, myio_close(io, rfd), "close read fd");
 
-    /* 3. Cancellation: start a long sleep and cancel it right away. The uv
-     *    backend cancels it; the sync backend has already slept by the time
-     *    we get the handle back, so cancel reports failure and the task
-     *    completed normally - exactly the documented best-effort contract.
-     *    (This is also why the sync demo pauses ~300 ms here.) */
+    /* 3. Cancellation: start a long sleep and cancel it right away. Cancel
+     *    is only a request - 0 means it was accepted, and the joined status
+     *    is the authoritative outcome. The uv and xev backends stop the
+     *    timer, so it joins as canceled; the sync backend has already slept
+     *    by the time we get the handle back, so cancel reports -1 and the
+     *    task completed normally. (This is also why the sync demo pauses
+     *    ~300 ms here.) */
     myio_task *nap = myio_sleep(io, 300);
     int canceled = myio_cancel(io, nap);
     r = myio_join(io, nap);

@@ -27,8 +27,9 @@
  * returns its index; NULL entries are skipped, so a fixed array of "slots"
  * can be selected on directly. Combining an IO task with a `myio_sleep()`
  * task gives timeouts (or use `myio_await_timeout()`). `myio_cancel()` is
- * best-effort: a backend (or an operation that already ran) may refuse, in
- * which case the task simply completes normally.
+ * only a request: the backend may refuse it, and even an accepted request
+ * can lose the race with completion. The task's final status, reported by
+ * `myio_await()`, is the sole authority on whether it was canceled.
  *
  * `myio_spawn()` runs an arbitrary (possibly blocking) function as a task,
  * making anything the built-in operations don't cover - name lookups,
@@ -121,7 +122,7 @@ typedef struct myio_ops {
 
     /* Synchronisation. */
     myio_result (*await)(myio *io, myio_task *task);
-    int         (*cancel)(myio *io, myio_task *task);     /* 0 ok, -1 refused */
+    int         (*cancel)(myio *io, myio_task *task); /* 0 requested, -1 refused */
     ptrdiff_t   (*select)(myio *io, myio_task **tasks, size_t ntasks);
                                                   /* NULL entries are skipped */
 
@@ -235,8 +236,18 @@ static inline myio_result myio_await(myio *io, myio_task *task) {
     return io->ops->await(io, task);
 }
 
-/* Best-effort cancellation: 0 if the task will complete as MYIO_CANCELED,
- * -1 if it cannot be canceled (already done, or backend can't stop it). */
+/* Request cancellation of an in-flight task. Returns 0 when the request was
+ * accepted, -1 when there is nothing to attempt (the task already completed,
+ * or the backend cannot stop this kind of operation at all). Acceptance is
+ * not a promise: cancellation is inherently racy, and the operation may
+ * still complete normally (or fail) before the request takes effect. The
+ * authoritative outcome is whatever myio_await() reports - MYIO_CANCELED
+ * only if the operation was actually stopped. In particular, a canceled
+ * tcp_connect or tcp_accept may still win and deliver a socket in
+ * result.ptr, which the caller then owns and must close as usual. A task
+ * with a cancellation pending stays outstanding until await reports it
+ * (e.g. a canceled sock_read still counts toward the one-read-per-socket
+ * limit until then). */
 static inline int myio_cancel(myio *io, myio_task *task) {
     return io->ops->cancel(io, task);
 }

@@ -11,9 +11,10 @@ libxev, and a blocking synchronous one.
 Operations start executing the moment they are submitted and return a
 `myio_task *` handle. `myio_await()` blocks until a task finishes and returns
 its `myio_result`; `myio_select()` waits for the first of a set to complete
-(race an op against `myio_sleep()` for timeouts); `myio_cancel()` is
-best-effort. In a fully synchronous backend the operation completes inside the
-submit call and `await` is a no-op — the calling code stays identical.
+(race an op against `myio_sleep()` for timeouts); `myio_cancel()` is only a
+request — the status `myio_await()` reports is the authoritative outcome. In a
+fully synchronous backend the operation completes inside the submit call and
+`await` is a no-op — the calling code stays identical.
 
 Task handles are caller-owned: release them with `myio_task_free()` after use.
 
@@ -73,10 +74,11 @@ Notes from the port, compared with the libuv backend:
   wakeup - the same trick libuv uses internally for both.
 - Cancellation differs per libxev backend: io_uring delivers
   `error.Canceled` to the canceled completion's callback, epoll kills the
-  completion *silently* (no callback), and epoll cannot cancel
-  thread-pool-routed work at all (so file reads/writes refuse cancellation
-  there, like a blocking backend). myio's best-effort `cancel` contract
-  absorbs all three.
+  completion *silently* (so the cancel operation's own callback completes
+  the task and releases what the dead completion held), and epoll cannot
+  cancel thread-pool-routed work at all (so file reads/writes refuse
+  cancellation there, like a blocking backend). myio's request-only
+  `cancel` contract absorbs all three.
 - One libxev invariant shapes the code: a completion callback must not
   synchronously `close()` an fd that is still registered with the loop
   (epoll deregisters it *after* the callback returns). Failed connects are

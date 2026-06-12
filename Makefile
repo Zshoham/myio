@@ -13,7 +13,7 @@ XEV_LIB = zig-out/lib/libmyio_xev.a
 SRC     = src/myio_uv.c src/myio_sync.c
 HEADERS = include/myio.h include/myio_uv.h include/myio_sync.h include/myio_xev.h
 
-all: demo chat chat_uv
+all: demo chat chat_uv cancel_test
 
 $(XEV_LIB): src/myio_xev.zig build.zig build.zig.zon
 	$(ZIG) build --release=safe
@@ -24,6 +24,9 @@ demo: examples/demo.c $(SRC) $(HEADERS) $(XEV_LIB)
 chat: examples/chat.c $(SRC) $(HEADERS) $(XEV_LIB)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(UV_CFLAGS) examples/chat.c $(SRC) $(XEV_LIB) $(UV_LIBS) -o $@
 
+cancel_test: examples/cancel_test.c $(SRC) $(HEADERS) $(XEV_LIB)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(UV_CFLAGS) examples/cancel_test.c $(SRC) $(XEV_LIB) $(UV_LIBS) -o $@
+
 # Comparison implementations of the same chat (see README).
 chat_uv: examples/chat_uv.c
 	$(CC) $(CFLAGS) $(UV_CFLAGS) examples/chat_uv.c $(UV_LIBS) -o $@
@@ -32,11 +35,13 @@ chat-rs:
 	cd examples/chat-rs && cargo build --release
 
 .PHONY: all test clean chat-rs
-test: demo
+test: demo cancel_test
 	./demo uv
 	./demo sync
 	./demo xev
+	./cancel_test uv
+	./cancel_test xev
 
 clean:
-	rm -f demo chat chat_uv demo1.tmp demo2.tmp
+	rm -f demo chat chat_uv cancel_test demo1.tmp demo2.tmp
 	rm -rf zig-out

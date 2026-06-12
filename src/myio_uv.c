@@ -511,6 +511,11 @@ static myio_result impl_await(myio *io, myio_task *task) {
     return t->res;
 }
 
+/* Cancellation is a request; the status reported by await is authoritative.
+ * libuv can stop timers, socket reads and pending accepts synchronously
+ * (no callback fires afterwards), so those genuinely complete as
+ * MYIO_CANCELED right here. Everything else is forwarded to libuv and the
+ * completion callback reports the outcome - canceled or not. */
 static int impl_cancel(myio *io, myio_task *task) {
     (void)io;
     uv_task *t = task_of(task);
