@@ -185,6 +185,11 @@ static inline myio_task *myio_read(myio *io, int64_t fd, void *buf, size_t len,
     return io->ops->read(io, fd, buf, len, offset);
 }
 
+/* Write up to `len` bytes; result.value is the byte count actually
+ * written, which - as with write(2) - may be less than `len`. This is
+ * deliberately asymmetric with myio_sock_write(): a file write is
+ * positional, so resubmitting from offset + result.value is trivial for
+ * the caller. `buf` must stay valid until the task completes. */
 static inline myio_task *myio_write(myio *io, int64_t fd, const void *buf,
                                     size_t len, int64_t offset) {
     return io->ops->write(io, fd, buf, len, offset);
@@ -245,7 +250,11 @@ static inline myio_task *myio_sock_read(myio *io, myio_sock *sock, void *buf,
 }
 
 /* Write the whole buffer; completes once all `len` bytes are queued to the
- * kernel (result.value == len). */
+ * kernel (result.value == len). Deliberately all-or-error, unlike the
+ * write(2) semantics of file myio_write(): continuing a partial send is
+ * one rearm inside a backend, but a caller-side await-and-resubmit helper
+ * could not participate in select(), so partial socket writes would be an
+ * unsolvable composition problem for callers. */
 static inline myio_task *myio_sock_write(myio *io, myio_sock *sock,
                                          const void *buf, size_t len) {
     return io->ops->sock_write(io, sock, buf, len);
