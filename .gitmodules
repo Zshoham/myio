@@ -1,0 +1,3 @@
+[submodule "vendor/libxev"]
+	path = vendor/libxev
+	url = https://github.com/mitchellh/libxev.git
