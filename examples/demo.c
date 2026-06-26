@@ -1,11 +1,14 @@
 /* Demo of the myio interface. The same program logic runs unchanged on the
- * libuv backend, the libxev backend, and the blocking synchronous backend:
+ * libuv backend, the libxev backend, the thread-pool backend, and the
+ * blocking synchronous backend:
  *
  *     ./demo uv
  *     ./demo xev
+ *     ./demo pool
  *     ./demo sync
  */
 #include "myio.h"
+#include "myio_pool.h"
 #include "myio_sync.h"
 #include "myio_uv.h"
 #include "myio_xev.h"
@@ -44,8 +47,10 @@ int main(int argc, char **argv) {
         io = myio_xev_new();
     else if (strcmp(backend, "sync") == 0)
         io = myio_sync_new();
+    else if (strcmp(backend, "pool") == 0)
+        io = myio_pool_new();
     else {
-        fprintf(stderr, "usage: %s [uv|xev|sync]\n", argv[0]);
+        fprintf(stderr, "usage: %s [uv|xev|sync|pool]\n", argv[0]);
         return 2;
     }
     if (!io) {

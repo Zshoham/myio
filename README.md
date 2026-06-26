@@ -3,8 +3,8 @@
 A backend-agnostic asynchronous IO interface for C. Programs code against
 `include/myio.h` only; the IO mechanism (event loop, thread pool, coroutines,
 or plain blocking calls) is picked by constructing a concrete backend and can
-be swapped without touching program logic. Three backends exist: libuv,
-libxev, and a blocking synchronous one.
+be swapped without touching program logic. Four backends exist: libuv,
+libxev, a thread pool, and a blocking synchronous one.
 
 ## Model
 
@@ -84,6 +84,36 @@ Notes from the port, compared with the libuv backend:
   (epoll deregisters it *after* the callback returns). Failed connects are
   therefore reclaimed with a loop-sequenced close, not `close(2)`.
 
+## The thread-pool backend
+
+`src/myio_pool.c` (`myio_pool_new()`) runs the exact blocking POSIX calls the
+synchronous backend makes, but on a pool of worker threads, so the submitting
+thread keeps going and several operations make progress at once. It depends
+only on libc and pthreads — no event loop.
+
+- **One mutex, two condition variables.** The mutex guards the work queue, the
+  socket list, and every task's status fields. Workers sleep on a `work` cv
+  until a task is queued; the (single) user thread sleeps on a `done` cv in
+  `await`/`select`. Every completion broadcasts `done`, and each waiter
+  re-checks its own predicate. The header's single-thread rule means
+  submit/await/cancel/free never race each other, only the workers — which the
+  mutex serialises.
+- **The pool grows on demand.** A submit hands the task to an idle worker if
+  one is waiting, otherwise it spawns a fresh thread. Because the operations
+  block, this is what keeps a slow op from starving a newly submitted one:
+  there is always a free or brand-new worker for incoming work. Threads are
+  kept for reuse and joined only at `destroy`.
+- **Cancellation reaches into running operations.** A still-queued task is
+  lifted out of the queue. A running sleep, accept or socket read is blocked
+  inside `ppoll()` with a dedicated signal unblocked only there; `cancel` sets
+  a flag and `pthread_kill`s the worker, so the `ppoll` returns `EINTR` and the
+  op reports `MYIO_CANCELED`. `ppoll`'s atomic mask swap closes the race a bare
+  signal would have (one arriving just before the blocking call). Operations
+  with no such interruption point — a running connect, file read/write, or
+  socket write — refuse cancellation; as always, `await` is authoritative.
+  `sock_close` additionally `shutdown(2)`s the socket to wake anything blocked
+  on it, then a close worker waits for those to drain before releasing the fd.
+
 ## Chat comparison
 
 The persistent peer-to-peer chat is implemented four times with identical
@@ -122,9 +152,12 @@ Observations:
 | `include/myio.h` | the interface (vtable + inline wrappers) |
 | `include/myio_uv.h`, `src/myio_uv.c` | libuv backend (`myio_uv_new`) |
 | `include/myio_xev.h`, `src/myio_xev.zig` | libxev backend (`myio_xev_new`), in Zig |
+| `include/myio_pool.h`, `src/myio_pool.c` | thread-pool backend (`myio_pool_new`), libc + pthreads only |
 | `include/myio_sync.h`, `src/myio_sync.c` | blocking single-threaded backend (`myio_sync_new`) |
 | `build.zig`, `vendor/libxev/` | build + vendored dependency of the libxev backend |
 | `examples/demo.c` | example exercising concurrency, select, cancel |
+| `examples/cancel_test.c` | cancel/detach contract checks (uv, xev, pool) |
+| `examples/concurrency_test.c` | concurrency + socket teardown checks (uv, xev, pool) |
 | `examples/chat.c` | single-threaded async peer-to-peer terminal chat |
 | `examples/chat_uv.c` | the same chat in raw libuv (comparison) |
 | `examples/chat_asyncio.py` | the same chat in Python asyncio (comparison) |
@@ -134,9 +167,10 @@ Observations:
 
 ```sh
 make            # builds ./demo and ./chat (requires libuv and zig >= 0.16)
-make test       # runs the demo on all three backends
+make test       # runs the demo on all four backends, plus the contract tests
 ./demo uv
 ./demo xev
+./demo pool
 ./demo sync
 ```
 
