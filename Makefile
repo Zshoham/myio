@@ -38,7 +38,37 @@ chat_uv: examples/chat_uv.c
 chat-rs:
 	cd examples/chat-rs && cargo build --release
 
-.PHONY: all test clean chat-rs
+# The Zephyr backend demo, built for native_sim. The Zephyr tree and
+# littlefs module are vendored as submodules (vendor/zephyr,
+# vendor/littlefs); override ZEPHYR_BASE/ZEPHYR_LFS to point elsewhere.
+# ZEPHYR_VENV is a python venv holding west + Zephyr's python deps; it is
+# created on first use (see $(ZEPHYR_VENV)/bin/west below) and prepended
+# to PATH for the cmake/ninja invocations.
+PYTHON       ?= python3
+ZEPHYR_BASE  ?= $(CURDIR)/vendor/zephyr
+ZEPHYR_LFS   ?= $(CURDIR)/vendor/littlefs
+ZEPHYR_VENV  ?= examples/zephyr_demo/venv
+ZEPHYR_BOARD ?= native_sim/native/64
+ZEPHYR_BUILD  = examples/zephyr_demo/build
+
+$(ZEPHYR_VENV)/bin/west: $(ZEPHYR_BASE)/scripts/requirements-base.txt
+	$(PYTHON) -m venv $(ZEPHYR_VENV)
+	$(ZEPHYR_VENV)/bin/pip install -q --upgrade pip
+	$(ZEPHYR_VENV)/bin/pip install -q west -r $(ZEPHYR_BASE)/scripts/requirements-base.txt
+
+zephyr_demo: $(ZEPHYR_VENV)/bin/west src/myio_zephyr.c include/myio.h include/myio_zephyr.h \
+             examples/zephyr_demo/src/main.c examples/zephyr_demo/prj.conf
+	test -f $(ZEPHYR_BUILD)/build.ninja || \
+	env PATH="$(ZEPHYR_VENV)/bin:$$PATH" \
+	    ZEPHYR_BASE=$(ZEPHYR_BASE) ZEPHYR_TOOLCHAIN_VARIANT=host \
+	    cmake -GNinja -B$(ZEPHYR_BUILD) -DBOARD=$(ZEPHYR_BOARD) \
+	        "-DZEPHYR_MODULES=$(CURDIR);$(ZEPHYR_LFS)" examples/zephyr_demo
+	env PATH="$(ZEPHYR_VENV)/bin:$$PATH" ninja -C $(ZEPHYR_BUILD)
+
+test-zephyr: zephyr_demo
+	./$(ZEPHYR_BUILD)/zephyr/zephyr.exe
+
+.PHONY: all test clean chat-rs zephyr_demo test-zephyr
 test: demo cancel_test concurrency_test
 	./demo uv
 	./demo sync
@@ -53,4 +83,4 @@ test: demo cancel_test concurrency_test
 
 clean:
 	rm -f demo chat chat_uv cancel_test concurrency_test demo1.tmp demo2.tmp
-	rm -rf zig-out
+	rm -rf zig-out examples/zephyr_demo/build* $(ZEPHYR_VENV)

@@ -1,0 +1,99 @@
+menuconfig MYIO
+	bool "myio backend-agnostic asynchronous IO"
+	depends on NET_SOCKETS
+	select ZVFS
+	select ZVFS_EVENTFD
+	select POLL
+	help
+	  Zephyr backend for the myio interface (myio_zephyr_new). Sockets
+	  and timers are asynchronous, driven by a zsock_poll() loop inside
+	  await/select; file operations complete inside submit. Requires a
+	  socket-capable network stack (native, or offloaded sockets).
+
+if MYIO
+
+config MYIO_MAX_TASKS
+	int "Maximum in-flight or unfreed tasks"
+	default 64
+	help
+	  Tasks are allocated from a fixed k_mem_slab of this many blocks.
+	  A submission with no free block returns NULL, which myio_join
+	  reports as ENOMEM.
+
+config MYIO_MAX_SOCKETS
+	int "Maximum live TCP sockets"
+	default 16
+	help
+	  Socket handles (listeners plus connections) come from a fixed
+	  k_mem_slab of this many blocks.
+
+config MYIO_MAX_FILES
+	int "Maximum open files"
+	default 8
+	help
+	  Size of the backend's file descriptor table mapping myio file
+	  descriptors onto struct fs_file_t. Only used when FILE_SYSTEM
+	  is enabled; without it, file operations fail with ENOSYS.
+
+config MYIO_SPAWN_INLINE
+	bool "Run myio_spawn functions inline in submit"
+	help
+	  Zero-extra-threads build: myio_spawn runs its function as a
+	  blocking call inside the submit and the task is already complete
+	  when it returns, exactly like a fully synchronous backend.
+	  Saves a worker thread and its stack on RAM-constrained targets.
+
+config MYIO_SPAWN_STACK_SIZE
+	int "Stack size of the myio_spawn work queue thread"
+	depends on !MYIO_SPAWN_INLINE
+	default 4096
+	help
+	  Spawned functions run on a dedicated work queue thread with this
+	  stack. Size it for the heaviest function passed to myio_spawn.
+
+config MYIO_SPAWN_PRIORITY
+	int "Preemptible priority of the myio_spawn work queue thread"
+	depends on !MYIO_SPAWN_INLINE
+	default 5
+
+config MYIO_POOL
+	bool "Thread-pool backend (myio_zephyr_pool_new)"
+	help
+	  A second Zephyr backend that runs every operation as a blocking
+	  call on a fixed pool of k_thread workers - the Zephyr port of the
+	  desktop thread-pool backend. Each worker needs an eventfd for
+	  cancellation, so CONFIG_ZVFS_EVENTFD_MAX must cover
+	  MYIO_POOL_WORKERS (plus one for the event-loop backend if both
+	  are used).
+
+if MYIO_POOL
+
+config MYIO_POOL_WORKERS
+	int "Worker threads in the pool"
+	default 4
+	help
+	  Unlike the desktop pool, the pool cannot grow: a submitted task
+	  waits for a free worker. Size this for the maximum number of
+	  concurrently *blocking* operations, or a queued task may be
+	  starved by blocked ones.
+
+config MYIO_POOL_STACK_SIZE
+	int "Stack size of each worker thread"
+	default 4096
+
+config MYIO_POOL_PRIORITY
+	int "Preemptible priority of the worker threads"
+	default 5
+
+config MYIO_STR_MAX
+	int "Maximum copied path/host string length"
+	default 64
+	help
+	  Submit copies open's path and connect's host into a fixed field
+	  of the slab-allocated task; longer strings fail the submission
+	  with ENAMETOOLONG. (The event-loop backend needs no copies: it
+	  opens and resolves inline in submit.)
+
+endif # MYIO_POOL
+
+endif # MYIO

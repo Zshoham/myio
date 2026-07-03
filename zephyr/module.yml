@@ -1,0 +1,4 @@
+name: myio
+build:
+  cmake: zephyr
+  kconfig: zephyr/Kconfig

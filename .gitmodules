@@ -1,3 +1,11 @@
 [submodule "vendor/libxev"]
 	path = vendor/libxev
 	url = https://github.com/mitchellh/libxev.git
+[submodule "vendor/zephyr"]
+	path = vendor/zephyr
+	url = https://github.com/zephyrproject-rtos/zephyr.git
+	shallow = true
+[submodule "vendor/littlefs"]
+	path = vendor/littlefs
+	url = https://github.com/zephyrproject-rtos/littlefs.git
+	shallow = true

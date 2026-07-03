@@ -7,3 +7,5 @@
 .zig-cache/
 zig-out/
 compile_commands.json
+examples/zephyr_demo/build*/
+examples/zephyr_demo/venv/
