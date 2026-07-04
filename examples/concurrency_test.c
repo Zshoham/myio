@@ -5,6 +5,7 @@
  *     ./concurrency_test uv
  *     ./concurrency_test xev
  *     ./concurrency_test pool
+ *     ./concurrency_test uring
  *
  * The sync backend is excluded for the same reason as cancel_test: every
  * operation completes inside its submit call, so a read with no data waiting
@@ -13,6 +14,7 @@
  */
 #include "myio.h"
 #include "myio_pool.h"
+#include "myio_uring.h"
 #include "myio_uv.h"
 #include "myio_xev.h"
 
@@ -49,6 +51,8 @@ static myio *make_io(const char *backend) {
         return myio_xev_new();
     if (strcmp(backend, "pool") == 0)
         return myio_pool_new();
+    if (strcmp(backend, "uring") == 0)
+        return myio_uring_new();
     return NULL;
 }
 
@@ -71,7 +75,7 @@ int main(int argc, char **argv) {
      * loop; warm it up so the fd baseline includes it. */
     myio *warm = make_io(backend);
     if (!warm) {
-        fprintf(stderr, "usage: %s [uv|xev|pool]\n", argv[0]);
+        fprintf(stderr, "usage: %s [uv|xev|pool|uring]\n", argv[0]);
         return 2;
     }
     myio_destroy(warm);

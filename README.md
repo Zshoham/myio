@@ -3,9 +3,9 @@
 A backend-agnostic asynchronous IO interface for C. Programs code against
 `include/myio.h` only; the IO mechanism (event loop, thread pool, coroutines,
 or plain blocking calls) is picked by constructing a concrete backend and can
-be swapped without touching program logic. Six backends exist: libuv,
-libxev, a thread pool, a blocking synchronous one, and two Zephyr RTOS
-backends (an event loop and a thread pool) — the Zephyr pair makes myio a
+be swapped without touching program logic. Seven backends exist: libuv,
+libxev, native io_uring, a thread pool, a blocking synchronous one, and two
+Zephyr RTOS backends (an event loop and a thread pool) — the Zephyr pair makes myio a
 portability layer across OS classes: develop protocol logic on Linux
 against libuv/libxev, ship the same code in firmware.
 
@@ -116,6 +116,85 @@ only on libc and pthreads — no event loop.
   socket write — refuse cancellation; as always, `await` is authoritative.
   `sock_close` additionally `shutdown(2)`s the socket to wake anything blocked
   on it, then a close worker waits for those to drain before releasing the fd.
+
+## The io_uring backend
+
+`src/myio_uring.c` (`myio_uring_new()`) implements the vtable directly on
+Linux io_uring via liburing — no event-loop library in between. It exists
+as a stress test of the interface: io_uring is the purest completion-queue
+model there is, so it shows precisely what the task model absorbs and where
+it pinches. The constructor returns NULL where io_uring is unavailable
+(pre-5.6 kernel, `kernel.io_uring_disabled`, Docker's default seccomp
+profile), so callers can fall back to another backend.
+
+What the interface absorbed without contortions:
+
+- **The myio task IS the io_uring completion object.** `user_data` carries
+  the task pointer and one SQE yields exactly one CQE, so there is no
+  impedance layer at all: no request objects (libuv), no completion structs
+  (libxev). The dispatch that libuv spreads over 13 callbacks is one
+  `switch (t->kind)` in the CQE drain, and every submit is prep + flush.
+  Honest measurement, though: at 830 lines vs libuv's 729 it is *not*
+  shorter — what the callbacks cost libuv, the explicit live-task and
+  live-socket lists cost here (libuv's loop tracks its handles for you;
+  a raw ring tracks nothing, and `destroy` has to find everything).
+- **The buffer-lifetime rules were already the kernel's rules.** "Buffers
+  stay valid until the task completes", "free may block", "detached buffers
+  stay valid until destroy" were written with thread pools in mind, but they
+  are exactly the conditions under which the kernel may read task memory
+  asynchronously (sockaddrs, timespecs, path strings live in the task until
+  the CQE). Nothing needed to change.
+- **One-CQE-per-SQE makes detach airtight.** A canceled op still delivers
+  its `-ECANCELED` CQE, so a detached task is always reaped on a real
+  kernel event — the guarantee epoll-libxev's silently-killed completions
+  had to reconstruct by hand.
+- **`sock_write`'s all-or-error contract has a kernel spelling:
+  `MSG_WAITALL`.** The header's "one rearm inside a backend" prediction
+  came true and then improved: a first version rearmed short sends from
+  userspace, and pushing 4 MB through a 4 KB `SO_SNDBUF` took 128
+  CQE→SQE round trips; with `MSG_WAITALL` the kernel retries internally
+  and delivers one CQE for the whole buffer. (Wall time was identical
+  either way — and identical to a plain blocking `send()` control — the
+  tiny-buffer test is bound by TCP window/delayed-ACK stalls, not by the
+  backend; the 1,154 `io_uring_enter` calls cost 21 ms of CPU across a
+  78 s run. The userspace rearm survives as the fallback for kernels
+  before 5.19 and for errors after partial progress.)
+
+What io_uring forced or exposed:
+
+- **Cancellation is itself an async operation — the one place the vtable
+  pinches.** `ASYNC_CANCEL` is an SQE with its own CQE, and even its result
+  does not settle the target (`-EALREADY` means "running, may still
+  complete"), but `cancel()` returns a synchronous int. The backend
+  resolves this by submitting the cancel and then driving the ring until
+  the *target's* CQE lands — legal because the re-entrancy guarantee means
+  no user code can observe the loop turning inside `cancel()`, bounded
+  because the kernel answers cancel requests promptly. The result is a
+  cancel that is *truthful* rather than optimistic: 0 iff the op really
+  was canceled — stronger than the request-only contract demands.
+- **The completion queue covers the OS, not the runtime.** io_uring has no
+  DNS op and cannot run arbitrary functions, so `tcp_connect` resolves
+  inline in submit and `myio_spawn` runs inline in submit — both sanctioned
+  by the eager-execution model (the Zephyr backend set the precedent). A
+  truly async spawn would need a thread completing through an eventfd whose
+  read is a pending ring op: the uv_async/xev.Async self-wake device yet
+  again. Every full backend so far has needed one; this backend dodges it
+  only by going inline.
+- **Eager submission costs one `io_uring_enter` per operation.** Submit
+  batching is io_uring's headline feature, and the header's "begins
+  executing as soon as the submit function returns" promise forbids it
+  (deferring SQEs to the next await would, e.g., skew when timers start).
+  Measured at 13–18 µs per call it is immaterial here, but it is the same
+  syscall count as blocking IO — and multishot accept/recv, provided
+  buffer rings, and registered fds are equally unreachable through a
+  pull-style one-op-at-a-time vtable with caller-owned buffers. The
+  interface caps how good the io_uring code can get at roughly the libuv
+  level; what it buys instead is the flattest possible implementation.
+- `sock_close` must cancel outstanding ops *before* closing the fd: an
+  in-flight recv holds a file reference, so `IORING_OP_CLOSE` alone would
+  never wake it. Cancel-then-close in SQ order suffices in practice; the
+  close CQE may arrive before the canceled ops' CQEs, so socket and tasks
+  are unlinked from each other at submit time.
 
 ## The Zephyr backend
 
@@ -310,6 +389,7 @@ Observations:
 | `include/myio_uv.h`, `src/myio_uv.c` | libuv backend (`myio_uv_new`) |
 | `include/myio_xev.h`, `src/myio_xev.zig` | libxev backend (`myio_xev_new`), in Zig |
 | `include/myio_pool.h`, `src/myio_pool.c` | thread-pool backend (`myio_pool_new`), libc + pthreads only |
+| `include/myio_uring.h`, `src/myio_uring.c` | native io_uring backend (`myio_uring_new`), Linux + liburing |
 | `include/myio_sync.h`, `src/myio_sync.c` | blocking single-threaded backend (`myio_sync_new`) |
 | `include/myio_zephyr.h`, `src/myio_zephyr.c` | Zephyr event-loop backend (`myio_zephyr_new`) |
 | `include/myio_zephyr_pool.h`, `src/myio_zephyr_pool.c` | Zephyr thread-pool backend (`myio_zephyr_pool_new`) |
@@ -317,8 +397,8 @@ Observations:
 | `build.zig`, `vendor/libxev/` | build + vendored dependency of the libxev backend |
 | `vendor/zephyr/`, `vendor/littlefs/` | vendored Zephyr tree (v4.2.0) and littlefs module for the Zephyr backends |
 | `examples/demo.c` | example exercising concurrency, select, cancel |
-| `examples/cancel_test.c` | cancel/detach contract checks (uv, xev, pool) |
-| `examples/concurrency_test.c` | concurrency + socket teardown checks (uv, xev, pool) |
+| `examples/cancel_test.c` | cancel/detach contract checks (uv, xev, pool, uring) |
+| `examples/concurrency_test.c` | concurrency + socket teardown checks (uv, xev, pool, uring) |
 | `examples/zephyr_demo/` | the demo + contract checks as a native_sim Zephyr app |
 | `examples/chat.c` | single-threaded async peer-to-peer terminal chat |
 | `examples/chat_uv.c` | the same chat in raw libuv (comparison) |
@@ -328,11 +408,12 @@ Observations:
 ## Build and run
 
 ```sh
-make            # builds ./demo and ./chat (requires libuv and zig >= 0.16)
-make test       # runs the demo on all four backends, plus the contract tests
+make            # builds ./demo and ./chat (requires libuv, liburing, zig >= 0.16)
+make test       # runs the demo on all five desktop backends, plus the contract tests
 ./demo uv
 ./demo xev
 ./demo pool
+./demo uring
 ./demo sync
 ```
 

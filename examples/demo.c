@@ -5,10 +5,12 @@
  *     ./demo uv
  *     ./demo xev
  *     ./demo pool
+ *     ./demo uring
  *     ./demo sync
  */
 #include "myio.h"
 #include "myio_pool.h"
+#include "myio_uring.h"
 #include "myio_sync.h"
 #include "myio_uv.h"
 #include "myio_xev.h"
@@ -49,8 +51,10 @@ int main(int argc, char **argv) {
         io = myio_sync_new();
     else if (strcmp(backend, "pool") == 0)
         io = myio_pool_new();
+    else if (strcmp(backend, "uring") == 0)
+        io = myio_uring_new();
     else {
-        fprintf(stderr, "usage: %s [uv|xev|sync|pool]\n", argv[0]);
+        fprintf(stderr, "usage: %s [uv|xev|sync|pool|uring]\n", argv[0]);
         return 2;
     }
     if (!io) {

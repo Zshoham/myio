@@ -4,6 +4,7 @@
  *     ./cancel_test uv
  *     ./cancel_test xev
  *     ./cancel_test pool
+ *     ./cancel_test uring
  *
  * The sync backend is deliberately excluded: every operation completes
  * inside its submit call, so a "pending" accept or read with no peer would
@@ -12,6 +13,7 @@
  */
 #include "myio.h"
 #include "myio_pool.h"
+#include "myio_uring.h"
 #include "myio_uv.h"
 #include "myio_xev.h"
 
@@ -47,6 +49,8 @@ static myio *make_io(const char *backend) {
         return myio_xev_new();
     if (strcmp(backend, "pool") == 0)
         return myio_pool_new();
+    if (strcmp(backend, "uring") == 0)
+        return myio_uring_new();
     return NULL;
 }
 
@@ -58,7 +62,7 @@ int main(int argc, char **argv) {
      * includes it. */
     myio *warm = make_io(backend);
     if (!warm) {
-        fprintf(stderr, "usage: %s [uv|xev|pool]\n", argv[0]);
+        fprintf(stderr, "usage: %s [uv|xev|pool|uring]\n", argv[0]);
         return 2;
     }
     myio_destroy(warm);
