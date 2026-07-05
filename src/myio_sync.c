@@ -4,6 +4,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "myio_sync.h"
 
+#include "myio_common.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -92,12 +94,6 @@ static myio_task *impl_spawn(myio *io, myio_fn fn, void *arg) {
 
 /* ---- TCP ---- */
 
-static int gai_errno(int rc) {
-    /* getaddrinfo has its own (negative) error namespace; keep it verbatim
-     * and let error_str render it honestly. EAI_SYSTEM defers to errno. */
-    return rc == EAI_SYSTEM ? errno : rc;
-}
-
 static myio_task *wrap_fd(int fd) {
     sync_sock *s = malloc(sizeof(*s));
     if (!s) {
@@ -110,64 +106,17 @@ static myio_task *wrap_fd(int fd) {
 
 static myio_task *impl_tcp_connect(myio *io, const char *host, int port) {
     (void)io;
-    char service[16];
-    snprintf(service, sizeof service, "%d", port);
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo *res = NULL;
-    int rc = getaddrinfo(host, service, &hints, &res);
-    if (rc != 0)
-        return task_err(gai_errno(rc));
-    int fd = -1, err = ECONNREFUSED;
-    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) {
-            err = errno;
-            continue;
-        }
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
-            break;
-        err = errno;
-        close(fd);
-        fd = -1;
-    }
-    freeaddrinfo(res);
+    int err = 0;
+    int fd = myio_posix_connect(host, port, &err);
     return fd >= 0 ? wrap_fd(fd) : task_err(err);
 }
 
 static myio_sock *impl_tcp_listen(myio *io, const char *host, int port,
                                   int backlog, int *err) {
     (void)io;
-    char service[16];
-    snprintf(service, sizeof service, "%d", port);
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE | AI_NUMERICHOST;
-    struct addrinfo *res = NULL;
-    int rc = getaddrinfo(host, service, &hints, &res);
-    if (rc != 0) {
-        if (err)
-            *err = gai_errno(rc);
+    int fd = myio_posix_listen(host, port, backlog, err);
+    if (fd < 0)
         return NULL;
-    }
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    int one = 1;
-    if (fd >= 0)
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    if (fd < 0 || bind(fd, res->ai_addr, res->ai_addrlen) != 0 ||
-        listen(fd, backlog) != 0) {
-        if (err)
-            *err = errno;
-        if (fd >= 0)
-            close(fd);
-        freeaddrinfo(res);
-        return NULL;
-    }
-    freeaddrinfo(res);
     sync_sock *s = malloc(sizeof(*s));
     if (!s) {
         if (err)
@@ -218,22 +167,17 @@ static myio_task *impl_sock_close(myio *io, myio_sock *sock) {
 
 static int impl_sock_port(myio *io, myio_sock *sock) {
     (void)io;
-    struct sockaddr_storage ss;
-    socklen_t len = sizeof ss;
-    if (getsockname(sock_of(sock)->fd, (struct sockaddr *)&ss, &len) != 0)
-        return -1;
-    if (ss.ss_family == AF_INET)
-        return ntohs(((struct sockaddr_in *)&ss)->sin_port);
-    if (ss.ss_family == AF_INET6)
-        return ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
-    return -1;
+    return myio_local_port(sock_of(sock)->fd);
 }
 
 /* ---- synchronisation and lifetime ---- */
 
-static myio_result impl_await(myio *io, myio_task *task) {
+/* Every operation completes inside its submit call, so there is never a
+ * pending task to make progress on: the generic await/select loops see
+ * task_done() == 1 and never get here. */
+static int impl_step(myio *io) {
     (void)io;
-    return task_of(task)->res;
+    return 0;
 }
 
 static int impl_cancel(myio *io, myio_task *task) {
@@ -242,20 +186,21 @@ static int impl_cancel(myio *io, myio_task *task) {
     return -1; /* operations always finish before a cancel can be issued */
 }
 
-static ptrdiff_t impl_select(myio *io, myio_task **tasks, size_t ntasks) {
+static myio_result impl_task_result(myio *io, const myio_task *task) {
     (void)io;
-    /* Everything is already complete; report the first real entry. */
-    for (size_t i = 0; i < ntasks; i++)
-        if (tasks[i])
-            return (ptrdiff_t)i;
-    return -1;
+    return ((const sync_task *)task)->res;
 }
 
 static const char *impl_error_str(myio *io, int err) {
     (void)io;
-    /* Negative codes are getaddrinfo's EAI_* range, kept verbatim by
-     * tcp_connect/tcp_listen; everything else is errno-style. */
-    return err < 0 ? gai_strerror(err) : strerror(err);
+    return myio_default_error_str(err);
+}
+
+static unsigned impl_caps(myio *io) {
+    (void)io;
+    /* Every operation completes inside submit: no concurrency, submit blocks,
+     * nothing to cancel, spawn runs inline. */
+    return 0;
 }
 
 static int impl_task_done(myio *io, const myio_task *task) {
@@ -300,10 +245,11 @@ static const myio_ops sync_ops = {
     .sock_write  = impl_sock_write,
     .sock_close  = impl_sock_close,
     .sock_port   = impl_sock_port,
-    .await       = impl_await,
+    .step        = impl_step,
     .cancel      = impl_cancel,
-    .select      = impl_select,
+    .task_result = impl_task_result,
     .error_str   = impl_error_str,
+    .caps        = impl_caps,
     .task_done   = impl_task_done,
     .task_free   = impl_task_free,
     .task_detach = impl_task_detach,

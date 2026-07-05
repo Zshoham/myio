@@ -7,10 +7,11 @@
  * One mutex guards all shared state (the work queue, the socket list, and
  * every task's status fields). Two condition variables sit under it:
  *   - work_cv  - idle workers sleep here until a task is queued;
- *   - done_cv  - the (single) user thread sleeps here in await/select, and
- *                a close worker sleeps here waiting for a socket to drain.
+ *   - done_cv  - the (single) user thread sleeps here in step() (the
+ *                primitive under the header's await/select loops), and a
+ *                close worker sleeps here waiting for a socket to drain.
  * Every completion broadcasts done_cv, so all waiters just re-check their
- * own predicate. Per the header's single-thread rule, submit/await/cancel/
+ * own predicate. Per the header's single-thread rule, submit/step/cancel/
  * free are only ever called from the one user thread, so they never race
  * each other - only with the workers, which the mutex serialises.
  *
@@ -22,6 +23,17 @@
  * always either a free worker or a brand-new one for incoming work. Threads
  * are kept (idle) for reuse and only joined at destroy.
  *
+ * Per-socket write ordering
+ * -------------------------
+ * Several writes may be outstanding on one socket, and the header promises
+ * the bytes of different writes never interleave on the wire. Two workers
+ * blocked in send() loops on the same fd would interleave freely, so writes
+ * on a socket are serialised through a per-socket FIFO (write_head /
+ * write_tail, linked by wnext, in submission order): the worker running a
+ * write waits on done_cv until its task reaches the head of that FIFO, then
+ * sends; on completion it pops itself and the broadcast lets the next worker
+ * take its turn.
+ *
  * Cancellation
  * ------------
  * A task still queued is canceled by lifting it out of the queue. A task a
@@ -31,13 +43,17 @@
  * cancel_req flag and pthread_kill()s the worker, so the ppoll returns EINTR
  * and the worker reports MYIO_CANCELED. ppoll's atomic mask swap closes the
  * "signal arrives just before the blocking call" race a bare signal would
- * have. Operations with no such interruption point (a running connect, file
- * read/write, or socket write) refuse cancellation; as everywhere, await
- * reports the authoritative outcome. sock_close additionally shuts the socket
- * down to wake anything blocked on it, which then completes as canceled.
+ * have. A socket write still waiting its turn behind an earlier write has put
+ * no bytes on the wire yet, so it too can be canceled (flag it and wake it on
+ * done_cv); the write actually sending at the head of the FIFO, like a
+ * running connect or file read/write, refuses. As everywhere, await reports
+ * the authoritative outcome. sock_close additionally shuts the socket down
+ * and wakes writers waiting their turn, which then complete as canceled.
  */
 #define _GNU_SOURCE /* ppoll */
 #include "myio_pool.h"
+
+#include "myio_common.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -91,6 +107,12 @@ typedef struct pool_sock {
     int               fd;
     int               closing;  /* sock_close has begun; ops report CANCELED */
     int               inflight; /* read/write/accept ops touching this fd */
+    /* Outstanding sock_writes, FIFO in submission order. The worker of a
+     * write only sends once its task reaches write_head; the rest wait on
+     * done_cv. This is what serialises overlapping writes so their bytes
+     * never interleave on the wire (see the file-top comment). */
+    struct pool_task *write_head;
+    struct pool_task *write_tail;
     struct pool_sock *next;
     struct pool_sock *prev;
 } pool_sock;
@@ -119,6 +141,7 @@ typedef struct pool_task {
     pthread_t        worker;  /* thread running it, valid once started */
     myio_result      res;
     struct pool_task *qnext;  /* work-queue link */
+    struct pool_task *wnext;  /* sock_write: per-socket write FIFO link */
 } pool_task;
 
 struct pool {
@@ -129,6 +152,15 @@ struct pool {
     pool_task      *qhead;
     pool_task      *qtail;
     size_t          nqueued;  /* tasks in the queue, not yet dequeued */
+    size_t          nrunning; /* tasks a worker has dequeued, not yet done */
+    /* Completion generation, for step(): completions counts every task a
+     * worker finishes; comp_seen is how many the user thread has observed
+     * through step(). A gap between them is progress step() can report
+     * without waiting - this is what keeps a completion that lands between
+     * the caller's task_done poll and step()'s cond_wait from being missed
+     * (its broadcast would otherwise have gone unheard). */
+    uint64_t        completions;
+    uint64_t        comp_seen;
     int             idle;     /* workers parked on work_cv */
     int             shutdown;
     pthread_t      *threads;
@@ -140,25 +172,6 @@ struct pool {
 
 static pool *pool_of(myio *io) { return (pool *)io; }
 static pool_task *task_of(myio_task *t) { return (pool_task *)t; }
-
-/* ---- result constructors ---- */
-
-static myio_result r_ok(int64_t value, void *ptr) {
-    myio_result r = { MYIO_OK, value, 0, ptr };
-    return r;
-}
-static myio_result r_err(int err) {
-    myio_result r = { MYIO_ERROR, 0, err, NULL };
-    return r;
-}
-static myio_result r_canceled(void) {
-    myio_result r = { MYIO_CANCELED, 0, 0, NULL };
-    return r;
-}
-/* For a raw syscall return: negative means failure, errno carries the code. */
-static myio_result r_from(int64_t n) {
-    return n >= 0 ? r_ok(n, NULL) : r_err(errno);
-}
 
 /* ---- socket list (all calls hold io->mu) ---- */
 
@@ -225,6 +238,33 @@ static void queue_remove(pool *p, pool_task *t) {
     }
 }
 
+/* ---- per-socket write FIFO (all calls hold io->mu) ---- */
+
+static void write_enqueue(pool_sock *s, pool_task *t) {
+    t->wnext = NULL;
+    if (s->write_tail)
+        s->write_tail->wnext = t;
+    else
+        s->write_head = t;
+    s->write_tail = t;
+}
+
+static void write_dequeue(pool_sock *s, pool_task *t) {
+    pool_task *prev = NULL;
+    for (pool_task *c = s->write_head; c; prev = c, c = c->wnext) {
+        if (c != t)
+            continue;
+        if (prev)
+            prev->wnext = c->wnext;
+        else
+            s->write_head = c->wnext;
+        if (s->write_tail == c)
+            s->write_tail = prev;
+        t->wnext = NULL;
+        return;
+    }
+}
+
 static int spawn_thread(pool *p); /* defined below, after the worker loop */
 
 /* Queue a task and make sure a worker will reach it. A parked worker can only
@@ -245,43 +285,6 @@ static int dispatch_locked(pool *p, pool_task *t) {
 }
 
 /* ---- worker thread ---- */
-
-/* Resolve and connect, mirroring the sync backend. Returns a connected fd, or
- * -1 with *err set (errno, or a getaddrinfo EAI_* code kept verbatim). */
-static int gai_errno(int rc) {
-    return rc == EAI_SYSTEM ? errno : rc;
-}
-
-static int do_connect(const char *host, int port, int *err) {
-    char service[16];
-    snprintf(service, sizeof service, "%d", port);
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo *res = NULL;
-    int rc = getaddrinfo(host, service, &hints, &res);
-    if (rc != 0) {
-        *err = gai_errno(rc);
-        return -1;
-    }
-    int fd = -1;
-    *err = ECONNREFUSED;
-    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) {
-            *err = errno;
-            continue;
-        }
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
-            break;
-        *err = errno;
-        close(fd);
-        fd = -1;
-    }
-    freeaddrinfo(res);
-    return fd;
-}
 
 /* Block until `fd` is readable (fd >= 0) or `timeout_ms` elapses (fd < 0, used
  * by sleep), whichever the op needs - but wake early and return -1 if the task
@@ -354,6 +357,8 @@ static void worker_close(pool_task *t) {
     pthread_mutex_lock(&p->mu);
     t->res = r_ok(0, NULL);
     t->done = 1;
+    p->nrunning--;
+    p->completions++;
     if (t->detached)
         reap(t);
     pthread_cond_broadcast(&p->done_cv);
@@ -406,6 +411,20 @@ static void worker_run(pool_task *t) {
             res = r_from(recv((int)t->fd, t->buf, t->len, 0));
         break;
     case OP_SOCK_WRITE: {
+        /* Wait for this write's turn: only the FIFO head sends, so the bytes
+         * of overlapping writes never interleave on the wire. Bail out
+         * without sending if the socket is closing/tearing down, or the wait
+         * was canceled - the commit below completes the task CANCELED. */
+        pthread_mutex_lock(&p->mu);
+        while (t->sock->write_head != t && !t->sock->closing &&
+               !p->shutdown && !t->cancel_req)
+            pthread_cond_wait(&p->done_cv, &p->mu);
+        int stop = t->sock->closing || p->shutdown || t->cancel_req;
+        pthread_mutex_unlock(&p->mu);
+        if (stop) {
+            res = r_canceled();
+            break;
+        }
         /* All-or-error, like the interface contract and the sync backend. */
         size_t off = 0;
         res = r_ok((int64_t)t->len, NULL);
@@ -423,7 +442,7 @@ static void worker_run(pool_task *t) {
         break;
     }
     case OP_CONNECT:
-        newfd = do_connect(t->path, t->port, &conn_err);
+        newfd = myio_posix_connect(t->path, t->port, &conn_err);
         res = r_err(conn_err);
         break;
     case OP_ACCEPT:
@@ -452,6 +471,8 @@ static void worker_run(pool_task *t) {
     }
     if (op_on_sock(t->kind)) {
         t->sock->inflight--;
+        if (t->kind == OP_SOCK_WRITE)
+            write_dequeue(t->sock, t); /* let the next queued write take over */
         if (t->sock->closing) {
             /* A connection accepted just as the listener closed is dropped. */
             if (res.ptr) {
@@ -465,6 +486,8 @@ static void worker_run(pool_task *t) {
     }
     t->res = res;
     t->done = 1;
+    p->nrunning--;
+    p->completions++;
     if (t->detached)
         reap(t);
     /* Always broadcast: an awaiter, or a close worker draining this socket,
@@ -497,6 +520,7 @@ static void *worker_main(void *arg) {
             p->qtail = NULL;
         t->qnext = NULL;
         p->nqueued--;
+        p->nrunning++;
         t->started = 1;
         t->worker = pthread_self(); /* cancel targets this thread now */
         pthread_mutex_unlock(&p->mu);
@@ -552,6 +576,10 @@ static myio_task *submit(pool_task *t) {
             t->sock->inflight--;
         t->res = r_err(EAGAIN);
         t->done = 1;
+    } else if (t->kind == OP_SOCK_WRITE) {
+        /* Join the socket's write FIFO in submission order (still under the
+         * lock the worker needs to reach the head, so it cannot outrun us). */
+        write_enqueue(t->sock, t);
     }
     pthread_mutex_unlock(&p->mu);
     return (myio_task *)t;
@@ -640,34 +668,9 @@ static myio_task *impl_tcp_connect(myio *io, const char *host, int port) {
 static myio_sock *impl_tcp_listen(myio *io, const char *host, int port,
                                   int backlog, int *err) {
     pool *p = pool_of(io);
-    char service[16];
-    snprintf(service, sizeof service, "%d", port);
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE | AI_NUMERICHOST;
-    struct addrinfo *res = NULL;
-    int rc = getaddrinfo(host, service, &hints, &res);
-    if (rc != 0) {
-        if (err)
-            *err = gai_errno(rc);
+    int fd = myio_posix_listen(host, port, backlog, err);
+    if (fd < 0)
         return NULL;
-    }
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    int one = 1;
-    if (fd >= 0)
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    if (fd < 0 || bind(fd, res->ai_addr, res->ai_addrlen) != 0 ||
-        listen(fd, backlog) != 0) {
-        if (err)
-            *err = errno;
-        if (fd >= 0)
-            close(fd);
-        freeaddrinfo(res);
-        return NULL;
-    }
-    freeaddrinfo(res);
     pthread_mutex_lock(&p->mu);
     pool_sock *s = sock_link(p, fd);
     pthread_mutex_unlock(&p->mu);
@@ -737,8 +740,12 @@ static myio_task *impl_sock_close(myio *io, myio_sock *sock) {
         return (myio_task *)t;
     }
     /* Wake the blocked read/write/accept so they can finish; a close worker
-     * then waits for them to drain. */
+     * then waits for them to drain. The shutdown interrupts a send already on
+     * the wire (the FIFO head); the broadcast wakes writers still waiting
+     * their turn on done_cv, which see `closing` and complete CANCELED
+     * without sending. */
     shutdown(s->fd, SHUT_RDWR);
+    pthread_cond_broadcast(&p->done_cv);
     if (!dispatch_locked(p, t)) {
         t->res = r_err(EAGAIN);
         t->done = 1;
@@ -749,28 +756,32 @@ static myio_task *impl_sock_close(myio *io, myio_sock *sock) {
 
 static int impl_sock_port(myio *io, myio_sock *sock) {
     (void)io;
-    struct sockaddr_storage ss;
-    socklen_t len = sizeof ss;
-    if (getsockname(((pool_sock *)sock)->fd, (struct sockaddr *)&ss, &len) != 0)
-        return -1;
-    if (ss.ss_family == AF_INET)
-        return ntohs(((struct sockaddr_in *)&ss)->sin_port);
-    if (ss.ss_family == AF_INET6)
-        return ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
-    return -1;
+    return myio_local_port(((pool_sock *)sock)->fd);
 }
 
 /* ---- synchronisation and lifetime ---- */
 
-static myio_result impl_await(myio *io, myio_task *task) {
+/* Report progress: a worker completion the user thread has not yet seen, or
+ * failing that, wait for the next one. Every pending task is either queued
+ * or running (nqueued + nrunning > 0), so 0 - no progress possible - is
+ * only ever returned when nothing is outstanding at all. The generation
+ * check makes step() immune to the check-then-wait race: a completion that
+ * landed after the caller's last task_done poll is reported immediately
+ * instead of sleeping through its (already spent) broadcast. A spurious 1
+ * merely sends the generic loop around once more. */
+static int impl_step(myio *io) {
     pool *p = pool_of(io);
-    pool_task *t = task_of(task);
     pthread_mutex_lock(&p->mu);
-    while (!t->done)
+    while (p->completions == p->comp_seen) {
+        if (p->nqueued == 0 && p->nrunning == 0) {
+            pthread_mutex_unlock(&p->mu);
+            return 0;
+        }
         pthread_cond_wait(&p->done_cv, &p->mu);
-    myio_result r = t->res;
+    }
+    p->comp_seen = p->completions;
     pthread_mutex_unlock(&p->mu);
-    return r;
+    return 1;
 }
 
 static int impl_cancel(myio *io, myio_task *task) {
@@ -785,6 +796,8 @@ static int impl_cancel(myio *io, myio_task *task) {
         queue_remove(p, t);
         if (op_on_sock(t->kind))
             t->sock->inflight--;
+        if (t->kind == OP_SOCK_WRITE)
+            write_dequeue(t->sock, t); /* may promote the next queued write */
         t->res = r_canceled();
         t->done = 1;
         if (t->detached)
@@ -798,38 +811,39 @@ static int impl_cancel(myio *io, myio_task *task) {
         t->cancel_req = 1;
         pthread_kill(t->worker, POOL_SIG);
         rc = 0;
+    } else if (t->kind == OP_SOCK_WRITE && t->sock->write_head != t) {
+        /* A write still waiting its turn behind an earlier write: no bytes on
+         * the wire yet, so it can still be canceled. Flag it and wake it; the
+         * worker completes it CANCELED and pops the FIFO. (The head write is
+         * already sending and refuses, like any running syscall.) */
+        t->cancel_req = 1;
+        pthread_cond_broadcast(&p->done_cv);
+        rc = 0;
     }
     pthread_mutex_unlock(&p->mu);
     return rc;
 }
 
-static ptrdiff_t impl_select(myio *io, myio_task **tasks, size_t ntasks) {
+static myio_result impl_task_result(myio *io, const myio_task *task) {
     pool *p = pool_of(io);
     pthread_mutex_lock(&p->mu);
-    for (;;) {
-        int any = 0;
-        for (size_t i = 0; i < ntasks; i++) {
-            if (!tasks[i])
-                continue;
-            any = 1;
-            if (task_of(tasks[i])->done) {
-                pthread_mutex_unlock(&p->mu);
-                return (ptrdiff_t)i;
-            }
-        }
-        if (!any) {
-            pthread_mutex_unlock(&p->mu);
-            return -1;
-        }
-        pthread_cond_wait(&p->done_cv, &p->mu);
-    }
+    myio_result r = ((const pool_task *)task)->res;
+    pthread_mutex_unlock(&p->mu);
+    return r;
 }
 
 static const char *impl_error_str(myio *io, int err) {
     (void)io;
-    /* Negatives are getaddrinfo's EAI_* range, kept verbatim by connect/
-     * listen; everything else is errno-style. */
-    return err < 0 ? gai_strerror(err) : strerror(err);
+    return myio_default_error_str(err);
+}
+
+static unsigned impl_caps(myio *io) {
+    (void)io;
+    /* Thread pool: ops run concurrently on workers, submit only enqueues, and
+     * spawn runs off-thread. Blocking file reads/writes on a worker cannot be
+     * interrupted, so no CANCEL_FILE. */
+    return MYIO_CAP_CONCURRENT_WAIT | MYIO_CAP_NONBLOCKING_SUBMIT |
+           MYIO_CAP_ASYNC_SPAWN;
 }
 
 static int impl_task_done(myio *io, const myio_task *task) {
@@ -850,16 +864,22 @@ static void impl_task_free(myio *io, myio_task *task) {
             queue_remove(p, t);
             if (op_on_sock(t->kind))
                 t->sock->inflight--;
+            if (t->kind == OP_SOCK_WRITE)
+                write_dequeue(t->sock, t);
             t->res = r_canceled();
             t->done = 1;
             pthread_cond_broadcast(&p->done_cv);
         } else {
             /* Running: the worker references this memory, so we must wait it
              * out - but first ask an interruptible op to stop, or the wait
-             * could be unbounded (a read with no data ever coming). */
+             * could be unbounded (a read with no data ever coming, or a write
+             * still waiting its turn behind a stalled peer). */
             if (op_interruptible(t->kind)) {
                 t->cancel_req = 1;
                 pthread_kill(t->worker, POOL_SIG);
+            } else if (t->kind == OP_SOCK_WRITE && t->sock->write_head != t) {
+                t->cancel_req = 1;
+                pthread_cond_broadcast(&p->done_cv);
             }
             while (!t->done)
                 pthread_cond_wait(&p->done_cv, &p->mu);
@@ -895,6 +915,8 @@ static void impl_destroy(myio *io) {
         pool_task *next = t->qnext;
         if (op_on_sock(t->kind))
             t->sock->inflight--;
+        if (t->kind == OP_SOCK_WRITE)
+            write_dequeue(t->sock, t);
         t->res = r_canceled();
         t->done = 1;
         reap(t);
@@ -941,10 +963,11 @@ static const myio_ops pool_ops = {
     .sock_write  = impl_sock_write,
     .sock_close  = impl_sock_close,
     .sock_port   = impl_sock_port,
-    .await       = impl_await,
+    .step        = impl_step,
     .cancel      = impl_cancel,
-    .select      = impl_select,
+    .task_result = impl_task_result,
     .error_str   = impl_error_str,
+    .caps        = impl_caps,
     .task_done   = impl_task_done,
     .task_free   = impl_task_free,
     .task_detach = impl_task_detach,

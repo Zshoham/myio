@@ -3,6 +3,7 @@
 #include "myio_uv.h"
 
 #include <errno.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -117,9 +118,11 @@ static void task_complete(uv_task *t, int64_t uv_result) {
         t->res.status = MYIO_CANCELED;
     } else {
         t->res.status = MYIO_ERROR;
-        /* Stored negated, so OS failures read as plain errnos while DNS
-         * failures keep libuv's own UV_EAI_* range; error_str undoes the
-         * negation and lets uv_strerror name either kind. */
+        /* Stored negated, so OS failures read as plain errnos; error_str
+         * undoes the negation and lets uv_strerror name them. Resolver
+         * failures never reach here - they complete through task_fail_gai,
+         * which stores a translated, verbatim (already-negative) EAI_*
+         * code instead. */
         t->res.error = (int)-uv_result;
     }
     task_finish(t);
@@ -310,13 +313,51 @@ static void connect_cb(uv_connect_t *req, int status) {
     task_complete(t, status);
 }
 
+/* Translate libuv's private UV_EAI_* getaddrinfo status into the platform's
+ * own <netdb.h> EAI_* constant, so a negative result.error is always the
+ * portable resolver code the header promises - never a libuv-only number
+ * no other backend (or caller) would recognize. glibc's EAI_* constants are
+ * themselves negative, so the translated value is stored as-is: no sign
+ * flip needed. Anything libuv reports that isn't one of its DNS-specific
+ * codes collapses to EAI_FAIL, the closest available meaning. */
+static int uv_eai_to_system(int status) {
+    switch (status) {
+    case UV_EAI_NONAME:   return EAI_NONAME;
+    case UV_EAI_AGAIN:    return EAI_AGAIN;
+    case UV_EAI_FAIL:     return EAI_FAIL;
+    case UV_EAI_FAMILY:   return EAI_FAMILY;
+    case UV_EAI_MEMORY:   return EAI_MEMORY;
+    case UV_EAI_SERVICE:  return EAI_SERVICE;
+    case UV_EAI_SOCKTYPE: return EAI_SOCKTYPE;
+    case UV_EAI_BADFLAGS: return EAI_BADFLAGS;
+#ifdef EAI_NODATA
+    case UV_EAI_NODATA:   return EAI_NODATA;
+#endif
+#ifdef EAI_OVERFLOW
+    case UV_EAI_OVERFLOW: return EAI_OVERFLOW;
+#endif
+    default:              return EAI_FAIL;
+    }
+}
+
+/* Complete a task with a resolver failure: bypasses task_complete's usual
+ * negate-to-errno handling (which would land DNS failures in libuv's private
+ * UV_EAI_* range) and instead stores the translated, negative EAI_* code
+ * directly - the same "set res, then task_finish" shape after_work_cb uses
+ * to keep myio_spawn's user codes verbatim. */
+static void task_fail_gai(uv_task *t, int uv_status) {
+    t->res.status = MYIO_ERROR;
+    t->res.error = uv_eai_to_system(uv_status);
+    task_finish(t);
+}
+
 static void gai_cb(uv_getaddrinfo_t *req, int status, struct addrinfo *res) {
     uv_task *t = req->data;
     if (status < 0) {
         sock_destroy(t->sock);
         t->sock = NULL;
         uv_freeaddrinfo(res);
-        task_complete(t, status);
+        task_fail_gai(t, status);
         return;
     }
     t->connecting = 1;
@@ -352,7 +393,7 @@ static myio_task *impl_tcp_connect(myio *io, const char *host, int port) {
     int rc = uv_getaddrinfo(&t->io->loop, &t->u.gai, gai_cb, host, service,
                             &hints);
     if (rc < 0) {
-        task_complete(t, rc);
+        task_fail_gai(t, rc);
         sock_destroy(t->sock);
         t->sock = NULL;
     }
@@ -525,6 +566,12 @@ static myio_task *impl_sock_close(myio *io, myio_sock *sock) {
         c = next;
     }
     s->pending_head = s->pending_tail = NULL;
+    /* Outstanding writes need no explicit handling: uv_write queues them
+     * FIFO (so overlapping writes never interleave), and uv_close on the tcp
+     * handle fires each pending write_cb with UV_ECANCELED, which
+     * task_complete maps to MYIO_CANCELED - exactly the header's contract.
+     * write_cb touches only its task, never the freed uv_sock, so callback
+     * order against sock_close_cb does not matter. */
     s->close_task = t;
     sock_destroy(s);
     return handle_of(t);
@@ -545,17 +592,13 @@ static int impl_sock_port(myio *io, myio_sock *sock) {
 
 /* ---- synchronisation ---- */
 
-static myio_result impl_await(myio *io, myio_task *task) {
-    uv_task *t = task_of(task);
-    while (!t->done) {
-        if (uv_run(&io_of(io)->loop, UV_RUN_ONCE) == 0 && !t->done) {
-            /* Loop has nothing left to do; the task can never complete. */
-            t->res.status = MYIO_ERROR;
-            t->res.error = EDEADLK;
-            t->done = 1;
-        }
-    }
-    return t->res;
+/* One blocking loop turn. uv_run(UV_RUN_ONCE)'s return value is the
+ * loop-alive flag: 0 means the loop drained - no handles, no requests -
+ * so nothing can ever complete again. The turn that processes the final
+ * completion also returns 0, which the header's generic loops handle by
+ * re-polling their tasks after a failed step. */
+static int impl_step(myio *io) {
+    return uv_run(&io_of(io)->loop, UV_RUN_ONCE) != 0;
 }
 
 /* Cancellation is a request; the status reported by await is authoritative.
@@ -600,32 +643,31 @@ static int impl_cancel(myio *io, myio_task *task) {
     }
 }
 
-static ptrdiff_t impl_select(myio *io, myio_task **tasks, size_t ntasks) {
-    for (;;) {
-        int any = 0;
-        for (size_t i = 0; i < ntasks; i++) {
-            if (!tasks[i])
-                continue;
-            any = 1;
-            if (task_of(tasks[i])->done)
-                return (ptrdiff_t)i;
-        }
-        if (!any)
-            return -1;
-        if (uv_run(&io_of(io)->loop, UV_RUN_ONCE) == 0) {
-            for (size_t i = 0; i < ntasks; i++)
-                if (tasks[i] && task_of(tasks[i])->done)
-                    return (ptrdiff_t)i;
-            return -1; /* loop drained without completing any of them */
-        }
-    }
+static myio_result impl_task_result(myio *io, const myio_task *task) {
+    (void)io;
+    return ((const uv_task *)task)->res;
 }
 
 static const char *impl_error_str(myio *io, int err) {
     uv_io *u = io_of(io);
-    /* Codes were stored negated; -err is a libuv error code, which on POSIX
-     * also covers plain errnos (UV_ENOENT == -ENOENT and so on). */
-    return uv_strerror_r(-err, u->errbuf, sizeof u->errbuf);
+    /* Negative: a getaddrinfo EAI_* code, translated and stored verbatim by
+     * task_fail_gai. Positive: stored negated (-uv_result), so -err is a
+     * libuv error code, which on POSIX also covers plain errnos (UV_ENOENT
+     * == -ENOENT and so on). */
+    if (err < 0)
+        snprintf(u->errbuf, sizeof u->errbuf, "%s", gai_strerror(err));
+    else
+        return uv_strerror_r(-err, u->errbuf, sizeof u->errbuf);
+    return u->errbuf;
+}
+
+static unsigned impl_caps(myio *io) {
+    (void)io;
+    /* Event loop: ops run concurrently and submit never blocks; spawn goes to
+     * the thread pool. File reads/writes run as blocking calls on that pool,
+     * so they cannot be canceled (no CANCEL_FILE). */
+    return MYIO_CAP_CONCURRENT_WAIT | MYIO_CAP_NONBLOCKING_SUBMIT |
+           MYIO_CAP_ASYNC_SPAWN;
 }
 
 /* ---- lifetime ---- */
@@ -639,9 +681,12 @@ static void impl_task_free(myio *io, myio_task *task) {
     uv_task *t = task_of(task);
     if (!t->done) {
         /* The in-flight request references this memory: cancel if possible,
-         * then drain until completion before releasing it. */
+         * then drain until completion before releasing it. A drained loop
+         * (uv_run returns 0) with the task still pending means no callback
+         * can ever touch it again, so releasing it is safe. */
         impl_cancel(io, task);
-        impl_await(io, task);
+        while (!t->done && uv_run(&io_of(io)->loop, UV_RUN_ONCE) != 0) {
+        }
     }
     if (t->kind == TASK_TIMER && !t->timer_closed) {
         t->free_on_close = 1;
@@ -706,10 +751,11 @@ static const myio_ops uv_ops = {
     .sock_write  = impl_sock_write,
     .sock_close  = impl_sock_close,
     .sock_port   = impl_sock_port,
-    .await       = impl_await,
+    .step        = impl_step,
     .cancel      = impl_cancel,
-    .select      = impl_select,
+    .task_result = impl_task_result,
     .error_str   = impl_error_str,
+    .caps        = impl_caps,
     .task_done   = impl_task_done,
     .task_free   = impl_task_free,
     .task_detach = impl_task_detach,

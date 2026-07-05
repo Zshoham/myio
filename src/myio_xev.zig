@@ -55,10 +55,11 @@ const Ops = extern struct {
     sock_write: *const fn (*Myio, *MyioSock, ?*const anyopaque, usize) callconv(.c) ?*MyioTask,
     sock_close: *const fn (*Myio, *MyioSock) callconv(.c) ?*MyioTask,
     sock_port: *const fn (*Myio, *MyioSock) callconv(.c) c_int,
-    @"await": *const fn (*Myio, *MyioTask) callconv(.c) Result,
+    step: *const fn (*Myio) callconv(.c) c_int,
     cancel: *const fn (*Myio, *MyioTask) callconv(.c) c_int,
-    select: *const fn (*Myio, [*]?*MyioTask, usize) callconv(.c) isize,
+    task_result: *const fn (*Myio, *const MyioTask) callconv(.c) Result,
     error_str: *const fn (*Myio, c_int) callconv(.c) [*:0]const u8,
+    caps: *const fn (*Myio) callconv(.c) c_uint,
     task_done: *const fn (*Myio, *const MyioTask) callconv(.c) c_int,
     task_free: *const fn (*Myio, *MyioTask) callconv(.c) void,
     task_detach: *const fn (*Myio, *MyioTask) callconv(.c) void,
@@ -66,6 +67,12 @@ const Ops = extern struct {
 };
 
 const MYIO_NO_OFFSET: i64 = -1;
+
+// Capability bits, mirroring the MYIO_CAP_* enum in include/myio.h.
+const MYIO_CAP_CONCURRENT_WAIT: c_uint = 1 << 0;
+const MYIO_CAP_NONBLOCKING_SUBMIT: c_uint = 1 << 1;
+const MYIO_CAP_CANCEL_FILE: c_uint = 1 << 2;
+const MYIO_CAP_ASYNC_SPAWN: c_uint = 1 << 3;
 
 /// Translate a Zig error from libxev/std into an errno-style code.
 fn errnoOf(err: anyerror) c_int {
@@ -184,7 +191,7 @@ fn Backend(comptime xev: type) type {
 
             sock: ?*Sock = null, // socket the task operates on, if any
             wbuf: []const u8 = &.{}, // full buffer of a sock_write
-            wnext: ?*Task = null, // sock's pending-write list
+            wnext: ?*Task = null, // sock's write FIFO link (next queued write)
         };
 
         const Sock = struct {
@@ -193,7 +200,14 @@ fn Backend(comptime xev: type) type {
             read_task: ?*Task = null, // outstanding sock_read (at most one)
             accept_task: ?*Task = null, // outstanding tcp_accept (at most one)
             close_task: ?*Task = null,
-            writes: ?*Task = null, // outstanding sock_writes
+            // Outstanding sock_writes, FIFO in submission order. Only the
+            // head has a write completion on the loop; the rest wait here
+            // (two concurrent sends on one fd give no ordering, so serialising
+            // the submissions ourselves is what implements the header's
+            // writes-in-submission-order, never-interleaved guarantee). Write
+            // tasks point back via t.sock and chain through t.wnext.
+            write_head: ?*Task = null,
+            write_tail: ?*Task = null,
             c_close: xev.Completion = .{}, // for sockDiscardAsync
             prev: ?*Sock = null,
             next: ?*Sock = null,
@@ -876,21 +890,48 @@ fn Backend(comptime xev: type) type {
             }
             t.sock = s;
             t.wbuf = @as([*]const u8, @ptrCast(buf.?))[0..len];
-            t.wnext = s.writes;
-            s.writes = t;
-            s.tcp.write(&io.loop, &t.c, .{ .slice = t.wbuf }, Task, t, sockWriteCb);
+            t.wnext = null;
+            if (s.write_tail) |tail| {
+                // A write is already outstanding: queue behind it with no loop
+                // completion of its own. sockWriteCb arms it once it reaches
+                // the head (see the FIFO comment on Sock).
+                tail.wnext = t;
+                s.write_tail = t;
+            } else {
+                s.write_head = t;
+                s.write_tail = t;
+                s.tcp.write(&io.loop, &t.c, .{ .slice = t.wbuf }, Task, t, sockWriteCb);
+            }
             return handleOf(t);
         }
 
+        /// Remove `t` from its socket's write FIFO, fixing up head and tail.
         fn writeListRemove(s: *Sock, t: *Task) void {
-            var p = &s.writes;
-            while (p.*) |cur| : (p = &cur.wnext) {
-                if (cur == t) {
-                    p.* = cur.wnext;
-                    cur.wnext = null;
+            var prev: ?*Task = null;
+            var cur = s.write_head;
+            while (cur) |c| {
+                if (c == t) {
+                    if (prev) |pv| pv.wnext = c.wnext else s.write_head = c.wnext;
+                    if (s.write_tail == c) s.write_tail = prev;
+                    c.wnext = null;
                     return;
                 }
+                prev = c;
+                cur = c.wnext;
             }
+        }
+
+        /// The head write just finished: pop it off the FIFO and arm the next
+        /// queued write's send, so writes hit the wire one at a time in
+        /// submission order.
+        fn writePopHead(t: *Task) void {
+            const s = t.sock orelse return; // t is the head by construction
+            t.sock = null;
+            s.write_head = t.wnext;
+            if (s.write_head == null) s.write_tail = null;
+            t.wnext = null;
+            if (s.write_head) |h|
+                s.tcp.write(&s.io.loop, &h.c, .{ .slice = h.wbuf }, Task, h, sockWriteCb);
         }
 
         fn sockWriteCb(
@@ -905,21 +946,16 @@ fn Backend(comptime xev: type) type {
             if (t.done) return .disarm; // socket closed under it
             if (r) |n| {
                 // myio_sock_write queues the whole buffer: continue from
-                // where a partial send stopped.
+                // where a partial send stopped (still the same head write, so
+                // no other write's bytes slip in between).
                 if (n < b.slice.len) {
                     c.op.send.buffer = .{ .slice = b.slice[n..] };
                     return .rearm;
                 }
-                if (t.sock) |s| {
-                    writeListRemove(s, t);
-                    t.sock = null;
-                }
+                writePopHead(t);
                 completeOk(t, @intCast(t.wbuf.len));
             } else |err| {
-                if (t.sock) |s| {
-                    writeListRemove(s, t);
-                    t.sock = null;
-                }
+                writePopHead(t);
                 if (isCanceled(err))
                     completeCanceled(t)
                 else
@@ -951,12 +987,23 @@ fn Backend(comptime xev: type) type {
                 completeCanceled(at);
                 submitCancel(io, &at.c, &at.c_cancel, at, cancelDoneCb);
             }
-            while (s.writes) |wt| {
-                s.writes = wt.wnext;
-                wt.wnext = null;
-                wt.sock = null;
-                completeCanceled(wt);
-                submitCancel(io, &wt.c, &wt.c_cancel, wt, cancelDoneCb);
+            // Writes: only the FIFO head has a loop completion, so cancel it
+            // like the read; the queued rest have none, so completing them
+            // canceled directly is all they need (no cancelDoneCb machinery
+            // applies). Complete every write first, then reap the head's
+            // completion.
+            if (s.write_head) |head| {
+                var w: ?*Task = head;
+                while (w) |wt| {
+                    const nxt = wt.wnext;
+                    wt.wnext = null;
+                    wt.sock = null;
+                    completeCanceled(wt);
+                    w = nxt;
+                }
+                s.write_head = null;
+                s.write_tail = null;
+                submitCancel(io, &head.c, &head.c_cancel, head, cancelDoneCb);
             }
             s.close_task = t;
             t.sock = s;
@@ -1000,22 +1047,19 @@ fn Backend(comptime xev: type) type {
             return io.loop.active == 0 and io.loop.submissions.empty();
         }
 
-        fn implAwait(m: *Myio, task: *MyioTask) callconv(.c) Result {
+        /// One blocking loop turn plus a sweep of finished detached tasks:
+        /// the step() primitive under the header's generic await/select.
+        /// Returns 0 once the loop is drained - no further completion can
+        /// ever arrive (a run error counts: the loop cannot be driven any
+        /// more). As in the old await/select loops, the drain check happens
+        /// AFTER the turn, so the turn that processes the final completion
+        /// already reports 0 - sound because the header's generic loops
+        /// re-poll their tasks once after a failed step.
+        fn implStep(m: *Myio) callconv(.c) c_int {
             const io = ioOf(m);
-            const t = taskOf(task);
-            while (!t.done) {
-                io.loop.run(.once) catch {
-                    completeErr(t, eint(E.IO));
-                    break;
-                };
-                reapDetached(io);
-                if (!t.done and loopDrained(io)) {
-                    // Loop has nothing left to do; the task can never
-                    // complete.
-                    completeErr(t, eint(E.DEADLK));
-                }
-            }
-            return t.res;
+            io.loop.run(.once) catch return 0;
+            reapDetached(io);
+            return @intFromBool(!loopDrained(io));
         }
 
         fn implCancel(m: *Myio, task: *MyioTask) callconv(.c) c_int {
@@ -1050,34 +1094,41 @@ fn Backend(comptime xev: type) type {
                     submitCancel(io, &t.c, &t.c_cancel, t, cancelDoneCb);
                     return 0;
                 },
-                // open/spawn already run on the pool; writes and closes
-                // cannot be taken back.
+                .sock_write => {
+                    const s = t.sock orelse return -1;
+                    // The head write is on the wire (or about to be); its
+                    // bytes may already be sent, so it refuses - like the
+                    // pool's running head and the zephyr partial write, and
+                    // sidestepping the epoll-vs-io_uring cancel asymmetry in
+                    // cancelDoneCb. A write still queued behind it has no loop
+                    // completion and no bytes sent: unlink and cancel it here.
+                    if (s.write_head == t) return -1;
+                    writeListRemove(s, t);
+                    t.sock = null;
+                    completeCanceled(t);
+                    return 0;
+                },
+                // open/spawn already run on the pool; closes cannot be taken
+                // back.
                 else => return -1,
             }
         }
 
-        fn implSelect(m: *Myio, tasks: [*]?*MyioTask, ntasks: usize) callconv(.c) isize {
-            const io = ioOf(m);
-            while (true) {
-                var any = false;
-                for (tasks[0..ntasks], 0..) |h, i| {
-                    if (h) |handle| {
-                        any = true;
-                        if (taskOf(handle).done) return @intCast(i);
-                    }
-                }
-                if (!any) return -1;
-                io.loop.run(.once) catch return -1;
-                reapDetached(io);
-                if (loopDrained(io)) {
-                    for (tasks[0..ntasks], 0..) |h, i|
-                        if (h != null and taskOf(h.?).done) return @intCast(i);
-                    return -1; // loop drained without completing any of them
-                }
-            }
+        fn implTaskResult(_: *Myio, task: *const MyioTask) callconv(.c) Result {
+            const t: *const Task = @ptrCast(@alignCast(task));
+            return t.res;
         }
 
         // ---- lifetime ----
+
+        fn implCaps(_: *Myio) callconv(.c) c_uint {
+            // Event loop: ops run concurrently, submit never blocks, spawn
+            // goes to the thread pool. File cancellation is only available
+            // when the comptime backend is io_uring (see file_cancelable).
+            return MYIO_CAP_CONCURRENT_WAIT | MYIO_CAP_NONBLOCKING_SUBMIT |
+                MYIO_CAP_ASYNC_SPAWN |
+                (if (file_cancelable) MYIO_CAP_CANCEL_FILE else 0);
+        }
 
         fn implTaskDone(_: *Myio, task: *const MyioTask) callconv(.c) c_int {
             const t: *const Task = @ptrCast(@alignCast(task));
@@ -1089,9 +1140,16 @@ fn Backend(comptime xev: type) type {
             const t = taskOf(task);
             if (!t.done) {
                 // The in-flight operation references this memory: cancel if
-                // possible, then wait for completion before releasing it.
+                // possible, then wait for completion before releasing it. A
+                // drained (or errored) loop with the task still pending
+                // means no callback can ever touch it again, so releasing
+                // it is safe regardless.
                 _ = implCancel(m, task);
-                _ = implAwait(m, task);
+                while (!t.done) {
+                    if (loopDrained(io)) break;
+                    io.loop.run(.once) catch break;
+                    reapDetached(io);
+                }
             }
             // A done task may still have loop completions in flight (e.g. a
             // cancellation that was just submitted); drain them so nothing
@@ -1160,10 +1218,11 @@ fn Backend(comptime xev: type) type {
             .sock_write = implSockWrite,
             .sock_close = implSockClose,
             .sock_port = implSockPort,
-            .@"await" = implAwait,
+            .step = implStep,
             .cancel = implCancel,
-            .select = implSelect,
+            .task_result = implTaskResult,
             .error_str = implErrorStr,
+            .caps = implCaps,
             .task_done = implTaskDone,
             .task_free = implTaskFree,
             .task_detach = implTaskDetach,
