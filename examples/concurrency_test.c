@@ -88,6 +88,26 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "backend: %s\n", backend);
 
+    /* Capabilities are a static property of the backend's execution model;
+     * assert the bits each backend must expose. Only bits that are
+     * unconditional for the backend are checked: xev's CANCEL_FILE depends on
+     * which libxev backend libxev picks at runtime (io_uring vs epoll), so it
+     * is deliberately left out here. */
+    unsigned caps = myio_caps(io);
+    if (strcmp(backend, "uv") == 0 || strcmp(backend, "pool") == 0 ||
+        strcmp(backend, "xev") == 0) {
+        expect((caps & MYIO_CAP_CONCURRENT_WAIT) &&
+                   (caps & MYIO_CAP_NONBLOCKING_SUBMIT) &&
+                   (caps & MYIO_CAP_ASYNC_SPAWN),
+               "caps: concurrent-wait, nonblocking-submit, async-spawn set");
+    } else if (strcmp(backend, "uring") == 0) {
+        expect((caps & MYIO_CAP_CONCURRENT_WAIT) &&
+                   (caps & MYIO_CAP_CANCEL_FILE) &&
+                   !(caps & MYIO_CAP_NONBLOCKING_SUBMIT) &&
+                   !(caps & MYIO_CAP_ASYNC_SPAWN),
+               "caps: concurrent-wait + cancel-file only (inline DNS/spawn)");
+    }
+
     /* Submit many tasks before awaiting any: real concurrency, and on a
      * thread pool this forces it to grow a worker per blocked slot. */
     myio_task *spawns[NSPAWN];
@@ -122,6 +142,102 @@ int main(int argc, char **argv) {
     myio_join(io, cl);
     expect(rr.status == MYIO_CANCELED,
            "sock_close interrupts a blocked read (CANCELED)");
+
+    /* Close a socket while a write on it is still blocked: write far more
+     * than the kernel will buffer to a peer that never reads, close the
+     * writer, and join the write - it must come back promptly as CANCELED
+     * (or ERROR), never hang. Exercises the backend's duty to cancel
+     * outstanding writes on close (an in-flight send otherwise keeps the
+     * task pending forever, and the join deadlocks). */
+    {
+        myio_result c2 = myio_join(io, myio_tcp_connect(io, "127.0.0.1", port));
+        myio_result a2 = myio_join(io, myio_tcp_accept(io, ls));
+        expect(myio_ok(c2) && myio_ok(a2), "writer/peer pair established");
+        myio_sock *wsock = c2.ptr, *peer = a2.ptr;
+        size_t biglen = 8u << 20; /* 8 MB: far beyond socket buffering */
+        char *big = malloc(biglen);
+        memset(big, 'x', biglen);
+        myio_task *w = myio_sock_write(io, wsock, big, biglen);
+        myio_join(io, myio_sleep(io, 20)); /* let the send fill the buffers */
+        myio_task *wcl = myio_sock_close(io, wsock);
+        myio_result wres = myio_join(io, w); /* hangs if close skips writes */
+        expect(wres.status == MYIO_CANCELED || wres.status == MYIO_ERROR,
+               "sock_close cancels a blocked write (no hang)");
+        myio_join(io, wcl);
+        myio_join(io, myio_sock_close(io, peer));
+        free(big);
+    }
+
+    /* Overlapping writes on one socket must land in submission order with
+     * no interleaving: three patterned buffers, submitted back to back and
+     * big enough that they are genuinely in flight together, must arrive as
+     * their exact concatenation. Every backend serialises writes per socket
+     * (event loops naturally, the thread pools through a per-socket write
+     * FIFO), so this runs on all of them. */
+    {
+        myio_result c3 = myio_join(io, myio_tcp_connect(io, "127.0.0.1", port));
+        myio_result a3 = myio_join(io, myio_tcp_accept(io, ls));
+        expect(myio_ok(c3) && myio_ok(a3), "ordering pair established");
+        myio_sock *tx = c3.ptr, *rx = a3.ptr;
+        const size_t wsz[3] = { 4u << 20, 1u << 20, 2u << 20 };
+        size_t total = wsz[0] + wsz[1] + wsz[2];
+        char *wb[3];
+        for (int i = 0; i < 3; i++) {
+            wb[i] = malloc(wsz[i]);
+            memset(wb[i], 'A' + i, wsz[i]);
+        }
+        char *rbuf = malloc(total);
+        myio_task *w[3];
+        for (int i = 0; i < 3; i++)
+            w[i] = myio_sock_write(io, tx, wb[i], wsz[i]);
+        size_t got = 0;
+        while (got < total) {
+            myio_result r =
+                myio_join(io, myio_sock_read(io, rx, rbuf + got, total - got));
+            if (!myio_ok(r) || r.value == 0)
+                break;
+            got += (size_t)r.value;
+        }
+        int writes_ok = 1;
+        for (int i = 0; i < 3; i++) {
+            myio_result r = myio_join(io, w[i]);
+            if (!myio_ok(r) || r.value != (int64_t)wsz[i])
+                writes_ok = 0;
+        }
+        expect(writes_ok, "3 overlapping writes each completed in full");
+        int order_ok = got == total;
+        size_t off = 0;
+        for (int i = 0; i < 3 && order_ok; i++) {
+            for (size_t j = 0; j < wsz[i]; j++)
+                if (rbuf[off + j] != 'A' + i) {
+                    order_ok = 0;
+                    break;
+                }
+            off += wsz[i];
+        }
+        expect(order_ok, "overlapping writes arrive in order, uninterleaved");
+        myio_join(io, myio_sock_close(io, tx));
+        myio_join(io, myio_sock_close(io, rx));
+        for (int i = 0; i < 3; i++)
+            free(wb[i]);
+        free(rbuf);
+    }
+
+    /* DNS resolution failures must surface as a negative result.error - the
+     * platform's getaddrinfo EAI_* code, verbatim (see myio.h) - not some
+     * backend-private range. "nonexistent.invalid" is reserved by RFC 6761
+     * and never resolves, but which EAI_* code a resolver reports for it
+     * varies (EAI_NONAME on some, EAI_AGAIN or EAI_NODATA on others), so
+     * only the sign and the rendered message are checked here, not the
+     * specific code. */
+    {
+        myio_result dr =
+            myio_join(io, myio_tcp_connect(io, "nonexistent.invalid", 80));
+        expect(dr.status == MYIO_ERROR, "DNS failure completes as MYIO_ERROR");
+        expect(dr.error < 0, "DNS failure stores a negative EAI_* code");
+        const char *msg = myio_strerror(io, dr.error);
+        expect(msg && *msg, "myio_strerror renders the DNS failure message");
+    }
 
     /* Detach a still-blocked read and let destroy reclaim it: the backend
      * must stop the operation and free everything without hanging. */

@@ -12,9 +12,11 @@
  * all times, plus either a peer read (connected) or accept/connect/retry
  * tasks (disconnected), and multiplexes them all with myio_select().
  * Terminal IO goes through the interface too (myio_read/myio_write on fds
- * 0 and 1). The uv backend is used because an interactive multiplexer
- * needs ops that wait concurrently; a fully synchronous backend would
- * block on stdin at submit time and degenerate into a turn-based chat.
+ * 0 and 1). An interactive multiplexer needs ops that wait concurrently: a
+ * fully synchronous backend would block on stdin at submit time and
+ * degenerate into a turn-based chat, so startup asserts
+ * MYIO_CAP_CONCURRENT_WAIT (uv and xev provide it) and refuses to run
+ * without it.
  *
  * If both sides dial each other at the same instant, two connections can
  * come up at once; each side keeps the one its select() reports first and
@@ -53,23 +55,18 @@ static uint64_t retry_ms(void) {
     return e ? (uint64_t)atoi(e) : 10000;
 }
 
-/* Retire a pending establishment task (accept/connect/sleep): request
- * cancellation and detach. If the task lost the race and completes with a
- * socket anyway, the backend closes it - that's exactly what detaching an
- * unclaimed result means. */
-static void drop_task(chat *c, myio_task **pt) {
-    if (!*pt)
-        return;
-    myio_cancel(c->io, *pt);
-    myio_task_detach(c->io, *pt);
-    *pt = NULL;
-}
-
 static void become_connected(chat *c, myio_sock *peer) {
     c->peer = peer;
-    drop_task(c, &c->taccept);
-    drop_task(c, &c->tconn);
-    drop_task(c, &c->tsleep);
+    /* Whichever of accept/connect/retry-sleep didn't deliver this peer
+     * lost the race; myio_task_drop() cancels and detaches it, and if it
+     * completes with a socket anyway, the backend closes it - nothing is
+     * left to claim the result. */
+    myio_task_drop(c->io, c->taccept);
+    c->taccept = NULL;
+    myio_task_drop(c->io, c->tconn);
+    c->tconn = NULL;
+    myio_task_drop(c->io, c->tsleep);
+    c->tsleep = NULL;
     c->tnet = myio_sock_read(c->io, c->peer, c->netbuf, sizeof c->netbuf);
     fprintf(stderr, "* peer connected\n");
 }
@@ -85,8 +82,7 @@ static void go_disconnected(chat *c) {
 
 static void disconnect_peer(chat *c) {
     if (c->tnet) {
-        myio_cancel(c->io, c->tnet);
-        myio_task_detach(c->io, c->tnet);
+        myio_task_drop(c->io, c->tnet);
         c->tnet = NULL;
     }
     if (c->peer) {
@@ -188,6 +184,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "* failed to create io backend\n");
         return 1;
     }
+    if (!(myio_caps(c.io) & MYIO_CAP_CONCURRENT_WAIT)) {
+        fprintf(stderr,
+                "* backend cannot wait on concurrent operations; "
+                "use uv or xev\n");
+        myio_destroy(c.io);
+        return 1;
+    }
     int err = 0;
     c.listener = myio_tcp_listen(c.io, "0.0.0.0", port, 1, &err);
     if (!c.listener) {
@@ -231,9 +234,12 @@ int main(int argc, char **argv) {
          * arrives. Let process exit reclaim everything instead. */
         _exit(0);
     }
-    drop_task(&c, &c.taccept);
-    drop_task(&c, &c.tconn);
-    drop_task(&c, &c.tsleep);
+    myio_task_drop(c.io, c.taccept);
+    c.taccept = NULL;
+    myio_task_drop(c.io, c.tconn);
+    c.tconn = NULL;
+    myio_task_drop(c.io, c.tsleep);
+    c.tsleep = NULL;
     disconnect_peer(&c);
     myio_join(c.io, myio_sock_close(c.io, c.listener));
     myio_destroy(c.io);
