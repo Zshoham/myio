@@ -25,16 +25,34 @@ Besides file IO and timers, the interface covers TCP: `myio_tcp_connect()`
 and `myio_tcp_accept()` deliver an opaque `myio_sock *` in `result.ptr`,
 `myio_tcp_listen()` creates a listener synchronously (port 0 = OS-assigned,
 query with `myio_sock_port()`), and `myio_sock_read/write/close()` operate on
-connections. At most one read and one accept may be outstanding per socket.
+connections. At most one read and one accept may be outstanding per socket;
+writes are unlimited but serialized — submission order, never interleaved on
+the wire. `myio_sock_close()` cancels the socket's outstanding reads, accepts,
+and writes.
 `myio_spawn()` runs an arbitrary (possibly blocking) function as a task, for
 anything the built-in operations don't cover.
+
+Backends differ in what their execution model guarantees, and `myio_caps()`
+makes those differences machine-checkable. It returns a bitmask of
+`MYIO_CAP_CONCURRENT_WAIT` (submitted ops progress while others are pending,
+so `myio_select()` truly multiplexes — false only for the synchronous
+backend), `MYIO_CAP_NONBLOCKING_SUBMIT` (submit never blocks on IO — false
+for sync and the inline-DNS/inline-file backends: Zephyr's event loop and
+native io_uring), `MYIO_CAP_CANCEL_FILE` (an in-flight file read/write can be
+canceled — true for io_uring and libxev-on-io_uring), and
+`MYIO_CAP_ASYNC_SPAWN` (`myio_spawn()` runs off the submitting thread). These
+describe the backend, not transient state, so a program checks them once at
+startup and fails loudly: `chat` asserts `MYIO_CAP_CONCURRENT_WAIT` and
+refuses to run on a backend that would block on stdin at submit time.
 
 Convenience helpers, built only from the vtable so they work on every
 backend: `myio_join()` (await + free, NULL-tolerant), `myio_await_all()`
 (asyncio's gather), `myio_await_timeout()` (asyncio's wait_for; returns a
-MYIO_PENDING result on timeout and leaves the task owned by the caller), and
-`myio_ok()`. `myio_select()` skips NULL entries, so state machines can select
-on a fixed array of slots and switch on the returned index.
+MYIO_PENDING result on timeout and leaves the task owned by the caller),
+`myio_task_drop()` (cancel-and-forget for a select loser or superseded
+attempt), and `myio_ok()`. `myio_select()` skips NULL entries, so state
+machines can select on a fixed array of slots and switch on the returned
+index.
 
 ## Design notes
 
@@ -442,4 +460,15 @@ Set `CHAT_RETRY_MS` to shorten the retry interval for testing.
 Implement the `myio_ops` vtable, embed `myio` as the first member of your
 context struct (or return a bare `myio` if you need no state), and provide a
 constructor like `myio *myio_mybackend_new(void)`. See `src/myio_sync.c` for
-the minimal shape.
+the minimal shape. A POSIX C backend can pull the shared boilerplate (result
+constructors, the getaddrinfo error mapping, the connect/listen walks, and the
+local-port and error-string helpers) from the internal `src/myio_common.h`.
+
+A backend supplies only the submit operations plus three small primitives:
+`step()` (block until at least one completion has been processed; return 0
+when the loop is drained and no progress is possible), `task_result()` (the
+stored result, non-blocking), and `task_done()` (non-blocking completion
+poll). The blocking machinery — `myio_await`, `myio_select`, and everything
+built on them (`myio_join`, `myio_await_all`, `myio_await_timeout`,
+`myio_task_drop`) — is implemented once as inlines in `myio.h` and comes for
+free.

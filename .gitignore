@@ -3,6 +3,8 @@
 /chat
 /chat_uv
 /cancel_test
+/concurrency_test
+/flash.bin
 *.tmp
 .zig-cache/
 zig-out/
