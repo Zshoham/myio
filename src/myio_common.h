@@ -1,27 +1,38 @@
-/* myio_common.h - shared scaffolding for the POSIX C backends (sync, pool,
- * uring). NOT part of the public API and NOT installed: it only collects the
- * byte-for-byte duplicated helpers those backends grew independently - result
- * constructors, the getaddrinfo error mapping, the connect/listen walks, and
- * the local-port and error-string boilerplate. Every helper is `static inline`
- * (the simplest linkage for an internal header compiled into each backend .c).
+/* myio_common.h - shared scaffolding for the C backends. NOT part of the
+ * public API and NOT installed: it only collects the byte-for-byte
+ * duplicated helpers the backends grew independently. Every helper is
+ * `static inline` (the simplest linkage for an internal header compiled
+ * into each backend .c).
  *
- * The zsock_* Zephyr backends deliberately do NOT use this - their socket
- * symbols differ - and the libuv/libxev backends have their own error models.
+ * Two layers:
+ *  - an OS-NEUTRAL CORE (result constructors, sockaddr->port) usable by
+ *    every C backend, the Zephyr pair included - hence the fenced
+ *    includes;
+ *  - POSIX-ONLY helpers (the getaddrinfo error mapping, the connect/
+ *    listen walks, local-port and error-string boilerplate) for the
+ *    desktop backends. The Zephyr backends keep their own copies of the
+ *    networking walks - their zsock_* symbols differ - and the libuv/
+ *    libxev backends have their own error models.
  */
 #ifndef MYIO_COMMON_H
 #define MYIO_COMMON_H
 
 #include "myio.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
+#include <stdint.h>
+
+#ifdef __ZEPHYR__
+#include <zephyr/net/socket.h> /* sockaddr_storage, sockaddr_in{,6}, ntohs */
+#else
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 /* ---- result constructors ---- */
 
@@ -41,6 +52,20 @@ static inline myio_result r_canceled(void) {
 static inline myio_result r_from(int64_t n) {
     return n >= 0 ? r_ok(n, NULL) : r_err(errno);
 }
+
+/* ---- sockaddr -> port ---- */
+
+/* The port stored in `ss`, host byte order, or -1 for a family that is
+ * neither AF_INET nor AF_INET6. */
+static inline int myio_sockaddr_port(const struct sockaddr_storage *ss) {
+    if (ss->ss_family == AF_INET)
+        return ntohs(((const struct sockaddr_in *)ss)->sin_port);
+    if (ss->ss_family == AF_INET6)
+        return ntohs(((const struct sockaddr_in6 *)ss)->sin6_port);
+    return -1;
+}
+
+#ifndef __ZEPHYR__ /* ---- POSIX-only helpers from here down ---- */
 
 /* ---- getaddrinfo error mapping ---- */
 
@@ -132,11 +157,7 @@ static inline int myio_local_port(int fd) {
     socklen_t len = sizeof ss;
     if (getsockname(fd, (struct sockaddr *)&ss, &len) != 0)
         return -1;
-    if (ss.ss_family == AF_INET)
-        return ntohs(((struct sockaddr_in *)&ss)->sin_port);
-    if (ss.ss_family == AF_INET6)
-        return ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
-    return -1;
+    return myio_sockaddr_port(&ss);
 }
 
 /* ---- error strings ---- */
@@ -146,5 +167,7 @@ static inline int myio_local_port(int fd) {
 static inline const char *myio_default_error_str(int err) {
     return err < 0 ? gai_strerror(err) : strerror(err);
 }
+
+#endif /* !__ZEPHYR__ */
 
 #endif /* MYIO_COMMON_H */

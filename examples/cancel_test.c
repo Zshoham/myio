@@ -11,48 +11,11 @@
  * simply block forever at submit time and there is never anything left to
  * cancel.
  */
-#include "myio.h"
-#include "myio_pool.h"
-#include "myio_uring.h"
-#include "myio_uv.h"
-#include "myio_xev.h"
+#include "test_common.h"
 
-#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static int failures = 0;
-
-static void expect(int cond, const char *what) {
-    fprintf(stderr, "  %-50s %s\n", what, cond ? "ok" : "FAIL");
-    if (!cond)
-        failures++;
-}
-
-/* Open fds of this process; canceled operations must not leak any. */
-static int count_fds(void) {
-    DIR *d = opendir("/proc/self/fd");
-    if (!d)
-        return -1;
-    int n = 0;
-    while (readdir(d))
-        n++;
-    closedir(d);
-    return n;
-}
-
-static myio *make_io(const char *backend) {
-    if (strcmp(backend, "uv") == 0)
-        return myio_uv_new();
-    if (strcmp(backend, "xev") == 0)
-        return myio_xev_new();
-    if (strcmp(backend, "pool") == 0)
-        return myio_pool_new();
-    if (strcmp(backend, "uring") == 0)
-        return myio_uring_new();
-    return NULL;
-}
 
 int main(int argc, char **argv) {
     const char *backend = argc > 1 ? argv[1] : "xev";

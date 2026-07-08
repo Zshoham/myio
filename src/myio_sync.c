@@ -28,28 +28,23 @@ typedef struct {
 static sync_task *task_of(myio_task *t) { return (sync_task *)t; }
 static sync_sock *sock_of(myio_sock *s) { return (sync_sock *)s; }
 
-static myio_task *task_err(int err) {
+/* Wrap an already-final result (everything completes inside submit here)
+ * in a fresh task handle. */
+static myio_task *task_res(myio_result res) {
     sync_task *t = calloc(1, sizeof(*t));
     if (!t)
         return NULL;
-    t->res.status = MYIO_ERROR;
-    t->res.error = err;
+    t->res = res;
     return (myio_task *)t;
 }
+
+static myio_task *task_err(int err) { return task_res(r_err(err)); }
 
 static myio_task *task_ok(int64_t value, void *ptr) {
-    sync_task *t = calloc(1, sizeof(*t));
-    if (!t)
-        return NULL;
-    t->res.status = MYIO_OK;
-    t->res.value = value;
-    t->res.ptr = ptr;
-    return (myio_task *)t;
+    return task_res(r_ok(value, ptr));
 }
 
-static myio_task *task_from(int64_t rc) {
-    return rc >= 0 ? task_ok(rc, NULL) : task_err(errno);
-}
+static myio_task *task_from(int64_t rc) { return task_res(r_from(rc)); }
 
 static myio_task *impl_open(myio *io, const char *path, int flags, int mode) {
     (void)io;

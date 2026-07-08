@@ -28,10 +28,10 @@ demo: examples/demo.c $(SRC) $(HEADERS) $(XEV_LIB)
 chat: examples/chat.c $(SRC) $(HEADERS) $(XEV_LIB)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(UV_CFLAGS) $(URING_CFLAGS) examples/chat.c $(SRC) $(XEV_LIB) $(UV_LIBS) $(URING_LIBS) -pthread -o $@
 
-cancel_test: examples/cancel_test.c $(SRC) $(HEADERS) $(XEV_LIB)
+cancel_test: examples/cancel_test.c examples/test_common.h $(SRC) $(HEADERS) $(XEV_LIB)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(UV_CFLAGS) $(URING_CFLAGS) examples/cancel_test.c $(SRC) $(XEV_LIB) $(UV_LIBS) $(URING_LIBS) -pthread -o $@
 
-concurrency_test: examples/concurrency_test.c $(SRC) $(HEADERS) $(XEV_LIB)
+concurrency_test: examples/concurrency_test.c examples/test_common.h $(SRC) $(HEADERS) $(XEV_LIB)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(UV_CFLAGS) $(URING_CFLAGS) examples/concurrency_test.c $(SRC) $(XEV_LIB) $(UV_LIBS) $(URING_LIBS) -pthread -o $@
 
 # Comparison implementations of the same chat (see README).

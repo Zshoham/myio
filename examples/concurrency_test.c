@@ -12,49 +12,12 @@
  * would simply block forever at submit time - there would be nothing in
  * flight to close out from under.
  */
-#include "myio.h"
-#include "myio_pool.h"
-#include "myio_uring.h"
-#include "myio_uv.h"
-#include "myio_xev.h"
+#include "test_common.h"
 
-#include <dirent.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static int failures = 0;
-
-static void expect(int cond, const char *what) {
-    fprintf(stderr, "  %-55s %s\n", what, cond ? "ok" : "FAIL");
-    if (!cond)
-        failures++;
-}
-
-/* Open fds of this process; teardown must not leak any. */
-static int count_fds(void) {
-    DIR *d = opendir("/proc/self/fd");
-    if (!d)
-        return -1;
-    int n = 0;
-    while (readdir(d))
-        n++;
-    closedir(d);
-    return n;
-}
-
-static myio *make_io(const char *backend) {
-    if (strcmp(backend, "uv") == 0)
-        return myio_uv_new();
-    if (strcmp(backend, "xev") == 0)
-        return myio_xev_new();
-    if (strcmp(backend, "pool") == 0)
-        return myio_pool_new();
-    if (strcmp(backend, "uring") == 0)
-        return myio_uring_new();
-    return NULL;
-}
 
 /* A spin of work, so backends with a worker pool actually run these in
  * parallel rather than instantly. Returns a value derived from the input. */
@@ -190,6 +153,13 @@ int main(int argc, char **argv) {
         myio_task *w[3];
         for (int i = 0; i < 3; i++)
             w[i] = myio_sock_write(io, tx, wb[i], wsz[i]);
+        /* A zero-length write takes its FIFO turn like any other write (the
+         * header's ordering contract covers completion order, not just
+         * bytes): submitted behind three still-in-flight writes, it must not
+         * have completed yet. */
+        myio_task *w0 = myio_sock_write(io, tx, "", 0);
+        expect(w0 && !myio_task_done(io, w0),
+               "zero-length write waits its turn, not done at submit");
         size_t got = 0;
         while (got < total) {
             myio_result r =
@@ -205,14 +175,14 @@ int main(int argc, char **argv) {
                 writes_ok = 0;
         }
         expect(writes_ok, "3 overlapping writes each completed in full");
+        myio_result r0 = myio_join(io, w0);
+        expect(myio_ok(r0) && r0.value == 0,
+               "zero-length write completes OK after its predecessors");
         int order_ok = got == total;
         size_t off = 0;
         for (int i = 0; i < 3 && order_ok; i++) {
-            for (size_t j = 0; j < wsz[i]; j++)
-                if (rbuf[off + j] != 'A' + i) {
-                    order_ok = 0;
-                    break;
-                }
+            if (memcmp(rbuf + off, wb[i], wsz[i]) != 0)
+                order_ok = 0;
             off += wsz[i];
         }
         expect(order_ok, "overlapping writes arrive in order, uninterleaved");

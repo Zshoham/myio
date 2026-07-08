@@ -1,10 +1,10 @@
 /*
  * myio - a backend-agnostic asynchronous IO interface.
  *
- * Programs depend only on this header. The actual IO mechanism (libuv event
- * loop, thread pool, stackful/stackless coroutines, or plain blocking calls)
- * is chosen by constructing a concrete `myio *` instance and can be swapped
- * without changing program code.
+ * Programs depend only on this header. The actual IO mechanism (a libuv or
+ * libxev event loop, native io_uring, a thread pool, plain blocking calls -
+ * on desktop or on Zephyr RTOS) is chosen by constructing a concrete
+ * `myio *` instance and can be swapped without changing program code.
  *
  * Execution model
  * ---------------
@@ -209,14 +209,19 @@ typedef struct myio_ops {
     /* Block until the backend has processed at least one completion (or
      * otherwise made observable progress), then return 1; a single call may
      * process any number of completions. Return 0 only when no progress is
-     * possible: nothing in flight, loop drained. A backend may complete its
-     * last task inside the very call that reports 0 (draining the final
-     * loop turn), so the generic loops re-poll their tasks once after a
-     * failed step before declaring a deadlock. The generic loops rely on a
-     * completed task's done flag being visible (through task_done) as soon
-     * as the step() call that processed it returns; in exchange, step() is
-     * only ever called between completions, never from inside one (the
-     * re-entrancy guarantee above). */
+     * possible: nothing in flight, loop drained - and never from a call
+     * that completed a task, even when that task was the last one and
+     * completing it drained the loop. Callers may therefore read a 0 as
+     * "no task changed state during this call, and none ever will", which
+     * is what lets the generic loops below report a deadlock without
+     * re-polling their tasks. (Backends whose loop reports only "still
+     * alive" - which is already false on the turn that processes the final
+     * completion - keep a completion counter and report a turn that
+     * advanced it as progress; see the libuv backend's step.) The generic
+     * loops rely on a completed task's done flag being visible (through
+     * task_done) as soon as the step() call that processed it returns; in
+     * exchange, step() is only ever called between completions, never from
+     * inside one (the re-entrancy guarantee above). */
     int         (*step)(myio *io);
 
     int         (*cancel)(myio *io, myio_task *task); /* 0 requested, -1 refused */
@@ -238,8 +243,10 @@ typedef struct myio_ops {
      * Static for the instance's lifetime (see the capabilities notes above). */
     unsigned (*caps)(myio *io);
 
-    /* Task and instance lifetime. */
-    int  (*task_done)(myio *io, const myio_task *task);   /* non-blocking poll */
+    /* Task and instance lifetime. task_done is a non-blocking poll and
+     * must agree with task_result: done exactly when the stored result's
+     * status is no longer MYIO_PENDING. */
+    int  (*task_done)(myio *io, const myio_task *task);
     void (*task_free)(myio *io, myio_task *task);
     void (*task_detach)(myio *io, myio_task *task);       /* free on completion */
     void (*destroy)(myio *io);
@@ -307,7 +314,9 @@ static inline myio_task *myio_spawn(myio *io, myio_fn fn, void *arg) {
  * Writes are not limited: several may be outstanding on one socket, and the
  * backend performs them in submission order, never interleaving the bytes
  * of different writes on the wire - as if each write completed before the
- * next began. (Without this guarantee, overlapping writes were silently
+ * next began. Zero-length writes take their turn like any other write: one
+ * submitted behind an in-flight write completes after it, on every backend.
+ * (Without this guarantee, overlapping writes were silently
  * backend-dependent: an event loop serializes them naturally, but two
  * thread-pool workers could interleave chunks of two buffers.)
  *
@@ -386,10 +395,8 @@ static inline int myio_sock_port(myio *io, myio_sock *sock) {
 static inline myio_result myio_await(myio *io, myio_task *task) {
     while (!io->ops->task_done(io, task)) {
         if (!io->ops->step(io)) {
-            /* Some backends complete tasks synchronously while draining
-             * their final loop turn: look once more before giving up. */
-            if (io->ops->task_done(io, task))
-                break;
+            /* step() never returns 0 from a call that completed a task,
+             * so this task can never complete: dependency deadlock. */
             myio_result r = { MYIO_ERROR, 0, EDEADLK, NULL };
             return r;
         }
@@ -438,11 +445,13 @@ static inline unsigned myio_caps(myio *io) {
 /* Block until at least one of `tasks` has completed; return the index of a
  * completed task (the lowest if several are done). NULL entries are skipped,
  * so a state machine can select on a fixed array of slots and switch on the
- * returned index. Returns -1 if no non-NULL task was given or the backend
- * cannot make progress. Does not consume results: await the winner
- * afterwards (it will not block). Because the lowest completed index wins, a
- * task that completes and is resubmitted on every iteration can starve later
- * slots; place always-hot tasks in later slots when that matters. */
+ * returned index. Returns -1 if no non-NULL task was given, or if the
+ * backend ran out of work with none of them completed - the select analogue
+ * of await's EDEADLK: none of these tasks can ever complete. Does not
+ * consume results: await the winner afterwards (it will not block). Because
+ * the lowest completed index wins, a task that completes and is resubmitted
+ * on every iteration can starve later slots; place always-hot tasks in
+ * later slots when that matters. */
 static inline ptrdiff_t myio_select(myio *io, myio_task **tasks,
                                     size_t ntasks) {
     for (;;) {
@@ -456,13 +465,8 @@ static inline ptrdiff_t myio_select(myio *io, myio_task **tasks,
         }
         if (!any)
             return -1;
-        if (!io->ops->step(io)) {
-            /* The final drain may have completed one synchronously. */
-            for (size_t i = 0; i < ntasks; i++)
-                if (tasks[i] && io->ops->task_done(io, tasks[i]))
-                    return (ptrdiff_t)i;
+        if (!io->ops->step(io))
             return -1; /* loop drained without completing any of them */
-        }
     }
 }
 
@@ -526,14 +530,27 @@ static inline myio_result myio_join(myio *io, myio_task *task) {
  * 0 if all completed with MYIO_OK, -1 otherwise. Does not free the tasks;
  * await or join them individually for their results. */
 static inline int myio_await_all(myio *io, myio_task **tasks, size_t ntasks) {
-    int all_ok = 0;
+    int rc = 0;
     for (size_t i = 0; i < ntasks; i++) {
-        if (!tasks[i])
-            all_ok = -1;
-        else if (myio_await(io, tasks[i]).status != MYIO_OK)
-            all_ok = -1;
+        if (!tasks[i] || myio_await(io, tasks[i]).status != MYIO_OK)
+            rc = -1;
     }
-    return all_ok;
+    return rc;
+}
+
+/* Retire a task whose result no longer matters - typically a select()
+ * loser or a superseded attempt: request cancellation and detach in one
+ * step. Cancellation is only best-effort, and ownership passes to the
+ * backend regardless; if the operation wins anyway its result is
+ * discarded (a socket it delivers is closed by the backend). The detach
+ * rules still apply: buffers handed to the operation must stay valid
+ * until it completes, or until the instance is destroyed. No-op on
+ * NULL. */
+static inline void myio_task_drop(myio *io, myio_task *task) {
+    if (!task)
+        return;
+    io->ops->cancel(io, task);
+    io->ops->task_detach(io, task);
 }
 
 /* Await `task` for at most `ms` milliseconds. If it completes in time, its
@@ -558,25 +575,9 @@ static inline myio_result myio_await_timeout(myio *io, myio_task *task,
             return r;
         }
         /* The task won: the still-ticking timer is of no further interest. */
-        myio_cancel(io, timer);
-        myio_task_detach(io, timer);
+        myio_task_drop(io, timer);
     }
     return myio_await(io, task);
-}
-
-/* Retire a task whose result no longer matters - typically a select()
- * loser or a superseded attempt: request cancellation and detach in one
- * step. Cancellation is only best-effort, and ownership passes to the
- * backend regardless; if the operation wins anyway its result is
- * discarded (a socket it delivers is closed by the backend). The detach
- * rules still apply: buffers handed to the operation must stay valid
- * until it completes, or until the instance is destroyed. No-op on
- * NULL. */
-static inline void myio_task_drop(myio *io, myio_task *task) {
-    if (!task)
-        return;
-    io->ops->cancel(io, task);
-    io->ops->task_detach(io, task);
 }
 
 #endif /* MYIO_H */

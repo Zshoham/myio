@@ -2,6 +2,10 @@
 #define _GNU_SOURCE /* uv.h needs POSIX/GNU types hidden by strict -std=c11 */
 #include "myio_uv.h"
 
+#include "myio_common.h" /* only the OS-neutral core: uv has its own error
+                            model and libuv does the resolving */
+#include "myio_wq.h"
+
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -13,6 +17,7 @@
 typedef struct {
     myio      base;
     uv_loop_t loop;
+    unsigned  ncompleted;  /* total tasks completed; step()'s progress signal */
     char      errbuf[128]; /* last myio_strerror rendering */
 } uv_io;
 
@@ -28,6 +33,17 @@ enum task_kind {
 };
 
 typedef struct uv_sock uv_sock;
+
+/* Kind-specific libuv request storage. Lives as a flexible tail on the
+ * task, allocated per kind (see task_size): uv_fs_t alone is 440 bytes,
+ * and only file ops need it. */
+union uv_req {
+    uv_fs_t          fs;
+    uv_timer_t       timer;
+    uv_getaddrinfo_t gai;
+    uv_write_t       write;
+    uv_work_t        work;
+};
 
 typedef struct uv_task {
     uv_io          *io;
@@ -47,33 +63,49 @@ typedef struct uv_task {
      * coordinate that with task_free. */
     int             timer_closed;
     int             free_on_close;
-    union {
-        uv_fs_t          fs;
-        uv_timer_t       timer;
-        uv_getaddrinfo_t gai;
-        uv_write_t       write;
-        uv_work_t        work;
-    } u;
+    /* The request tail: 0 or 1 elements, sized by the task's kind at
+     * allocation (accept, socket read and socket close drive the socket's
+     * own handle and get none). */
+    union uv_req    u[];
 } uv_task;
 
 struct uv_sock {
-    uv_tcp_t  tcp;
-    uv_io    *io;
-    uv_task  *read_task;    /* outstanding sock_read (at most one) */
-    uv_task  *accept_task;  /* outstanding tcp_accept (at most one) */
-    uv_task  *close_task;
-    uv_sock  *pending_head; /* accepted connections not yet claimed */
-    uv_sock  *pending_tail;
-    uv_sock  *next_pending;
+    uv_tcp_t     tcp;
+    uv_io       *io;
+    uv_task     *read_task;   /* outstanding sock_read (at most one) */
+    uv_task     *accept_task; /* outstanding tcp_accept (at most one) */
+    uv_task     *close_task;
+    myio_wq      pending;     /* accepted connections not yet claimed */
+    myio_wq_node pnode;       /* this socket's link in its listener's queue */
 };
+
+/* The accepted-but-unclaimed socket whose pnode is `n` (n non-NULL). */
+#define pending_sock(n) myio_wq_item(n, uv_sock, pnode)
 
 static uv_task *task_of(myio_task *t) { return (uv_task *)t; }
 static myio_task *handle_of(uv_task *t) { return (myio_task *)t; }
 static uv_io *io_of(myio *io) { return (uv_io *)io; }
 static uv_sock *sock_of(myio_sock *s) { return (uv_sock *)s; }
 
+/* A task's allocation: the fixed struct plus the one request member its
+ * kind uses from the flexible tail. */
+static size_t task_size(enum task_kind kind) {
+    size_t base = sizeof(uv_task);
+    switch (kind) {
+    case TASK_FS:         return base + sizeof(uv_fs_t);
+    case TASK_TIMER:      return base + sizeof(uv_timer_t);
+    case TASK_SPAWN:      return base + sizeof(uv_work_t);
+    case TASK_CONNECT:    return base + sizeof(uv_getaddrinfo_t);
+    case TASK_SOCK_WRITE: return base + sizeof(uv_write_t);
+    case TASK_ACCEPT:
+    case TASK_SOCK_READ:
+    case TASK_SOCK_CLOSE: return base;
+    }
+    return base + sizeof(union uv_req);
+}
+
 static uv_task *task_new(uv_io *io, enum task_kind kind) {
-    uv_task *t = calloc(1, sizeof(*t));
+    uv_task *t = calloc(1, task_size(kind));
     if (!t)
         return NULL;
     t->io = io;
@@ -94,8 +126,8 @@ static void task_reap(uv_task *t) {
         /* The timer handle lives inside the task; it must finish closing
          * before the memory can go. */
         t->free_on_close = 1;
-        if (!uv_is_closing((uv_handle_t *)&t->u.timer))
-            uv_close((uv_handle_t *)&t->u.timer, timer_close_cb);
+        if (!uv_is_closing((uv_handle_t *)&t->u->timer))
+            uv_close((uv_handle_t *)&t->u->timer, timer_close_cb);
         return;
     }
     free(t);
@@ -106,6 +138,7 @@ static void task_reap(uv_task *t) {
  * final event, so nothing references the task afterwards). */
 static void task_finish(uv_task *t) {
     t->done = 1;
+    t->io->ncompleted++;
     if (t->detached)
         task_reap(t);
 }
@@ -195,10 +228,10 @@ static myio_task *impl_open(myio *io, const char *path, int flags, int mode) {
     uv_task *t = task_new(io_of(io), TASK_FS);
     if (!t)
         return NULL;
-    t->u.fs.data = t;
+    t->u->fs.data = t;
     /* uv_fs_open copies `path` into the request, which is what gives the
      * header's "strings are copied by submit" guarantee. */
-    return fs_submitted(t, uv_fs_open(&t->io->loop, &t->u.fs, path, flags,
+    return fs_submitted(t, uv_fs_open(&t->io->loop, &t->u->fs, path, flags,
                                       mode, fs_cb));
 }
 
@@ -206,8 +239,8 @@ static myio_task *impl_close(myio *io, int64_t fd) {
     uv_task *t = task_new(io_of(io), TASK_FS);
     if (!t)
         return NULL;
-    t->u.fs.data = t;
-    return fs_submitted(t, uv_fs_close(&t->io->loop, &t->u.fs, (uv_file)fd,
+    t->u->fs.data = t;
+    return fs_submitted(t, uv_fs_close(&t->io->loop, &t->u->fs, (uv_file)fd,
                                        fs_cb));
 }
 
@@ -216,9 +249,9 @@ static myio_task *impl_read(myio *io, int64_t fd, void *buf, size_t len,
     uv_task *t = task_new(io_of(io), TASK_FS);
     if (!t)
         return NULL;
-    t->u.fs.data = t;
+    t->u->fs.data = t;
     t->buf = uv_buf_init(buf, (unsigned)len);
-    return fs_submitted(t, uv_fs_read(&t->io->loop, &t->u.fs, (uv_file)fd,
+    return fs_submitted(t, uv_fs_read(&t->io->loop, &t->u->fs, (uv_file)fd,
                                       &t->buf, 1, offset, fs_cb));
 }
 
@@ -227,9 +260,9 @@ static myio_task *impl_write(myio *io, int64_t fd, const void *buf, size_t len,
     uv_task *t = task_new(io_of(io), TASK_FS);
     if (!t)
         return NULL;
-    t->u.fs.data = t;
+    t->u->fs.data = t;
     t->buf = uv_buf_init((char *)(uintptr_t)buf, (unsigned)len);
-    return fs_submitted(t, uv_fs_write(&t->io->loop, &t->u.fs, (uv_file)fd,
+    return fs_submitted(t, uv_fs_write(&t->io->loop, &t->u->fs, (uv_file)fd,
                                        &t->buf, 1, offset, fs_cb));
 }
 
@@ -254,12 +287,12 @@ static myio_task *impl_sleep(myio *io, uint64_t ms) {
     uv_task *t = task_new(io_of(io), TASK_TIMER);
     if (!t)
         return NULL;
-    uv_timer_init(&t->io->loop, &t->u.timer);
-    t->u.timer.data = t;
-    int rc = uv_timer_start(&t->u.timer, timer_cb, ms, 0);
+    uv_timer_init(&t->io->loop, &t->u->timer);
+    t->u->timer.data = t;
+    int rc = uv_timer_start(&t->u->timer, timer_cb, ms, 0);
     if (rc < 0) {
         task_complete(t, rc);
-        uv_close((uv_handle_t *)&t->u.timer, timer_close_cb);
+        uv_close((uv_handle_t *)&t->u->timer, timer_close_cb);
     }
     return handle_of(t);
 }
@@ -292,8 +325,8 @@ static myio_task *impl_spawn(myio *io, myio_fn fn, void *arg) {
         return NULL;
     t->fn = fn;
     t->arg = arg;
-    t->u.work.data = t;
-    int rc = uv_queue_work(&t->io->loop, &t->u.work, work_cb, after_work_cb);
+    t->u->work.data = t;
+    int rc = uv_queue_work(&t->io->loop, &t->u->work, work_cb, after_work_cb);
     if (rc < 0)
         task_complete(t, rc);
     return handle_of(t);
@@ -387,10 +420,10 @@ static myio_task *impl_tcp_connect(myio *io, const char *host, int port) {
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    t->u.gai.data = t;
+    t->u->gai.data = t;
     /* uv_getaddrinfo copies `host` and `service`, which is what gives the
      * header's "strings are copied by submit" guarantee. */
-    int rc = uv_getaddrinfo(&t->io->loop, &t->u.gai, gai_cb, host, service,
+    int rc = uv_getaddrinfo(&t->io->loop, &t->u->gai, gai_cb, host, service,
                             &hints);
     if (rc < 0) {
         task_fail_gai(t, rc);
@@ -427,11 +460,7 @@ static void connection_cb(uv_stream_t *server, int status) {
         t->res.ptr = c;
         task_complete(t, 0);
     } else {
-        if (ls->pending_tail)
-            ls->pending_tail->next_pending = c;
-        else
-            ls->pending_head = c;
-        ls->pending_tail = c;
+        myio_wq_push(&ls->pending, &c->pnode);
     }
 }
 
@@ -469,12 +498,9 @@ static myio_task *impl_tcp_accept(myio *io, myio_sock *listener) {
     if (!t)
         return NULL;
     t->sock = ls;
-    uv_sock *c = ls->pending_head;
-    if (c) {
-        ls->pending_head = c->next_pending;
-        if (!ls->pending_head)
-            ls->pending_tail = NULL;
-        c->next_pending = NULL;
+    if (ls->pending.head) {
+        uv_sock *c = pending_sock(ls->pending.head);
+        myio_wq_pop(&ls->pending);
         t->res.ptr = c;
         task_complete(t, 0);
     } else {
@@ -536,8 +562,8 @@ static myio_task *impl_sock_write(myio *io, myio_sock *sock, const void *buf,
         return NULL;
     t->sock = sock_of(sock);
     t->buf = uv_buf_init((char *)(uintptr_t)buf, (unsigned)len);
-    t->u.write.data = t;
-    int rc = uv_write(&t->u.write, (uv_stream_t *)&t->sock->tcp, &t->buf, 1,
+    t->u->write.data = t;
+    int rc = uv_write(&t->u->write, (uv_stream_t *)&t->sock->tcp, &t->buf, 1,
                       write_cb);
     if (rc < 0)
         task_complete(t, rc);
@@ -560,12 +586,11 @@ static myio_task *impl_sock_close(myio *io, myio_sock *sock) {
         s->accept_task = NULL;
     }
     /* Drop parked connections nobody accepted. */
-    for (uv_sock *c = s->pending_head; c;) {
-        uv_sock *next = c->next_pending;
+    while (s->pending.head) {
+        uv_sock *c = pending_sock(s->pending.head);
+        myio_wq_pop(&s->pending);
         sock_destroy(c);
-        c = next;
     }
-    s->pending_head = s->pending_tail = NULL;
     /* Outstanding writes need no explicit handling: uv_write queues them
      * FIFO (so overlapping writes never interleave), and uv_close on the tcp
      * handle fires each pending write_cb with UV_ECANCELED, which
@@ -583,22 +608,22 @@ static int impl_sock_port(myio *io, myio_sock *sock) {
     int len = sizeof ss;
     if (uv_tcp_getsockname(&sock_of(sock)->tcp, (struct sockaddr *)&ss, &len))
         return -1;
-    if (ss.ss_family == AF_INET)
-        return ntohs(((struct sockaddr_in *)&ss)->sin_port);
-    if (ss.ss_family == AF_INET6)
-        return ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
-    return -1;
+    return myio_sockaddr_port(&ss);
 }
 
 /* ---- synchronisation ---- */
 
 /* One blocking loop turn. uv_run(UV_RUN_ONCE)'s return value is the
  * loop-alive flag: 0 means the loop drained - no handles, no requests -
- * so nothing can ever complete again. The turn that processes the final
- * completion also returns 0, which the header's generic loops handle by
- * re-polling their tasks after a failed step. */
+ * so nothing can ever complete again. But it is already 0 on the turn
+ * that processes the final completion, and step()'s contract forbids
+ * returning 0 from a call that completed a task, so a turn that advanced
+ * the completion counter reports progress regardless. */
 static int impl_step(myio *io) {
-    return uv_run(&io_of(io)->loop, UV_RUN_ONCE) != 0;
+    uv_io *u = io_of(io);
+    unsigned before = u->ncompleted;
+    int alive = uv_run(&u->loop, UV_RUN_ONCE) != 0;
+    return alive || u->ncompleted != before;
 }
 
 /* Cancellation is a request; the status reported by await is authoritative.
@@ -613,19 +638,19 @@ static int impl_cancel(myio *io, myio_task *task) {
         return -1;
     switch (t->kind) {
     case TASK_TIMER:
-        uv_timer_stop(&t->u.timer);
-        uv_close((uv_handle_t *)&t->u.timer, timer_close_cb);
+        uv_timer_stop(&t->u->timer);
+        uv_close((uv_handle_t *)&t->u->timer, timer_close_cb);
         task_complete(t, UV_ECANCELED);
         return 0;
     case TASK_FS:
         /* Succeeds only while the request is still queued on the thread
          * pool; fs_cb will then deliver UV_ECANCELED. */
-        return uv_cancel((uv_req_t *)&t->u.fs) == 0 ? 0 : -1;
+        return uv_cancel((uv_req_t *)&t->u->fs) == 0 ? 0 : -1;
     case TASK_SPAWN:
-        return uv_cancel((uv_req_t *)&t->u.work) == 0 ? 0 : -1;
+        return uv_cancel((uv_req_t *)&t->u->work) == 0 ? 0 : -1;
     case TASK_CONNECT:
         if (!t->connecting)
-            return uv_cancel((uv_req_t *)&t->u.gai) == 0 ? 0 : -1;
+            return uv_cancel((uv_req_t *)&t->u->gai) == 0 ? 0 : -1;
         /* Closing the handle makes connect_cb fire with UV_ECANCELED. */
         sock_destroy(t->sock);
         return 0;
@@ -681,17 +706,17 @@ static void impl_task_free(myio *io, myio_task *task) {
     uv_task *t = task_of(task);
     if (!t->done) {
         /* The in-flight request references this memory: cancel if possible,
-         * then drain until completion before releasing it. A drained loop
-         * (uv_run returns 0) with the task still pending means no callback
-         * can ever touch it again, so releasing it is safe. */
+         * then step until completion before releasing it. A failed step
+         * with the task still pending means no callback can ever touch it
+         * again, so releasing it is safe. */
         impl_cancel(io, task);
-        while (!t->done && uv_run(&io_of(io)->loop, UV_RUN_ONCE) != 0) {
+        while (!t->done && impl_step(io)) {
         }
     }
     if (t->kind == TASK_TIMER && !t->timer_closed) {
         t->free_on_close = 1;
-        if (!uv_is_closing((uv_handle_t *)&t->u.timer))
-            uv_close((uv_handle_t *)&t->u.timer, timer_close_cb);
+        if (!uv_is_closing((uv_handle_t *)&t->u->timer))
+            uv_close((uv_handle_t *)&t->u->timer, timer_close_cb);
         return; /* freed by timer_close_cb once the loop runs */
     }
     free(t);

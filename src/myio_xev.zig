@@ -153,6 +153,7 @@ fn Backend(comptime xev: type) type {
             socks: ?*Sock, // every live socket, for teardown in destroy
             reap: ?*Task, // detached tasks that finished, awaiting reclaim
             detached_live: usize, // detached tasks not yet reclaimed
+            ncompleted: usize = 0, // total tasks completed; implStep's progress signal
         };
 
         const Task = struct {
@@ -262,6 +263,7 @@ fn Backend(comptime xev: type) type {
         /// its completions are referenced by the loop anymore.
         fn finish(t: *Task) void {
             t.done = true;
+            t.io.ncompleted += 1;
             if (!t.detached) return;
             discardResult(t);
             t.rnext = t.io.reap;
@@ -884,25 +886,33 @@ fn Backend(comptime xev: type) type {
             const io = ioOf(m);
             const s = sockOf(sock);
             const t = taskNew(io, .sock_write) orelse return null;
-            if (len == 0) {
-                completeOk(t, 0);
-                return handleOf(t);
-            }
             t.sock = s;
-            t.wbuf = @as([*]const u8, @ptrCast(buf.?))[0..len];
+            // A zero-length write still takes its FIFO turn (the header's
+            // ordering contract covers completion order, not just bytes);
+            // wbuf keeps its empty default, and buf may be null.
+            if (len != 0)
+                t.wbuf = @as([*]const u8, @ptrCast(buf.?))[0..len];
+            if (writePush(s, t))
+                s.tcp.write(&io.loop, &t.c, .{ .slice = t.wbuf }, Task, t, sockWriteCb);
+            return handleOf(t);
+        }
+
+        /// Append to the socket's write FIFO; true when the write became the
+        /// head - nothing was outstanding and the caller arms its send now.
+        /// A queued non-head write gets no loop completion of its own:
+        /// sockWriteCb arms it once it reaches the head (see the FIFO
+        /// comment on Sock). This mirrors the C backends' myio_wq push/pop/
+        /// remove shape (src/myio_wq.h).
+        fn writePush(s: *Sock, t: *Task) bool {
             t.wnext = null;
             if (s.write_tail) |tail| {
-                // A write is already outstanding: queue behind it with no loop
-                // completion of its own. sockWriteCb arms it once it reaches
-                // the head (see the FIFO comment on Sock).
                 tail.wnext = t;
                 s.write_tail = t;
-            } else {
-                s.write_head = t;
-                s.write_tail = t;
-                s.tcp.write(&io.loop, &t.c, .{ .slice = t.wbuf }, Task, t, sockWriteCb);
+                return false;
             }
-            return handleOf(t);
+            s.write_head = t;
+            s.write_tail = t;
+            return true;
         }
 
         /// Remove `t` from its socket's write FIFO, fixing up head and tail.
@@ -1051,15 +1061,17 @@ fn Backend(comptime xev: type) type {
         /// the step() primitive under the header's generic await/select.
         /// Returns 0 once the loop is drained - no further completion can
         /// ever arrive (a run error counts: the loop cannot be driven any
-        /// more). As in the old await/select loops, the drain check happens
-        /// AFTER the turn, so the turn that processes the final completion
-        /// already reports 0 - sound because the header's generic loops
-        /// re-poll their tasks once after a failed step.
+        /// more). The drain check happens AFTER the turn, which alone would
+        /// report 0 on the very turn that processes the final completion;
+        /// step()'s contract forbids that, so a turn that advanced the
+        /// completion counter reports progress regardless.
         fn implStep(m: *Myio) callconv(.c) c_int {
             const io = ioOf(m);
-            io.loop.run(.once) catch return 0;
+            const before = io.ncompleted;
+            io.loop.run(.once) catch
+                return @intFromBool(io.ncompleted != before);
             reapDetached(io);
-            return @intFromBool(!loopDrained(io));
+            return @intFromBool(!loopDrained(io) or io.ncompleted != before);
         }
 
         fn implCancel(m: *Myio, task: *MyioTask) callconv(.c) c_int {
@@ -1140,25 +1152,17 @@ fn Backend(comptime xev: type) type {
             const t = taskOf(task);
             if (!t.done) {
                 // The in-flight operation references this memory: cancel if
-                // possible, then wait for completion before releasing it. A
-                // drained (or errored) loop with the task still pending
-                // means no callback can ever touch it again, so releasing
-                // it is safe regardless.
+                // possible, then step until completion before releasing it.
+                // A failed step with the task still pending means no
+                // callback can ever touch it again, so releasing it is safe
+                // regardless.
                 _ = implCancel(m, task);
-                while (!t.done) {
-                    if (loopDrained(io)) break;
-                    io.loop.run(.once) catch break;
-                    reapDetached(io);
-                }
+                while (!t.done and implStep(m) != 0) {}
             }
             // A done task may still have loop completions in flight (e.g. a
             // cancellation that was just submitted); drain them so nothing
             // dangles into freed memory.
-            while (!taskIdle(t)) {
-                if (loopDrained(io)) break;
-                io.loop.run(.once) catch break;
-                reapDetached(io);
-            }
+            while (!taskIdle(t) and implStep(m) != 0) {}
             taskDestroy(io, t);
         }
 
@@ -1187,9 +1191,9 @@ fn Backend(comptime xev: type) type {
             // documented for myio_destroy).
             reapDetached(io);
             while (io.detached_live > 0) {
-                if (loopDrained(io)) break; // leak rather than free live memory
-                io.loop.run(.once) catch break;
-                reapDetached(io);
+                // A failed step means the rest can never complete: leak
+                // rather than free live memory.
+                if (implStep(m) == 0) break;
             }
             // Reclaim sockets that were never closed (the listener of a
             // crashed-out program, say); their fds would otherwise leak.

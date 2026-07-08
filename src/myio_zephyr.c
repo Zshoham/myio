@@ -2,9 +2,9 @@
  *
  * Zephyr offers no event loop and no completion API - only readiness
  * primitives - so unlike the libuv/libxev backends this one runs its own
- * mini event loop: await and select are the same while(!done)
- * run_loop_once() shape as the libuv backend, except run_loop_once() is
- * ours: zsock_poll() over the in-flight socket operations plus one eventfd,
+ * mini event loop: the step() primitive under the header's generic
+ * await/select is one turn of run_loop_once(), which is ours:
+ * zsock_poll() over the in-flight socket operations plus one eventfd,
  * with the timeout derived from the earliest pending timer.
  *
  * The backend is a hybrid the execution model explicitly sanctions: file
@@ -25,6 +25,9 @@
  * path. Nothing here calls malloc.
  */
 #include "myio_zephyr.h"
+
+#include "myio_common.h"
+#include "myio_wq.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -65,7 +68,7 @@ struct z_task {
     const void     *cbuf;       /* sock_write source */
     size_t          len;
     size_t          off;        /* sock_write: bytes already queued */
-    z_task         *wnext;      /* sock_write: next write in the socket FIFO */
+    myio_wq_node    wnode;      /* sock_write: link in the socket's write FIFO */
     int64_t         deadline;   /* timer: absolute k_uptime_get() ms */
     myio_fn         fn;         /* spawn: function, argument, return */
     void           *arg;
@@ -85,11 +88,13 @@ struct z_sock {
     /* Outstanding sock_writes, FIFO in submission order. Only the head is on
      * the poll set (advanced by write_try); the rest wait here until it
      * completes, so overlapping writes hit the wire one at a time and never
-     * interleave. Write tasks chain through t->wnext. */
-    z_task  *write_head;
-    z_task  *write_tail;
+     * interleave. Write tasks chain through their wnode links. */
+    myio_wq  wq;
     z_sock  *next;         /* io->socks registry, for destroy's sweep */
 };
+
+/* The write task whose wnode is `n` (n must be non-NULL). */
+#define wq_task(n) myio_wq_item(n, z_task, wnode)
 
 struct z_io {
     myio     base;
@@ -100,6 +105,13 @@ struct z_io {
     z_task  *spawn_done;   /* spawns finished off-thread, not yet harvested */
     struct k_spinlock done_lock; /* guards spawn_done and task->pushed */
     char     errbuf[64];   /* last myio_strerror rendering */
+    /* run_loop_once's poll set. Instance state rather than locals: at the
+     * default MYIO_MAX_TASKS=64 the two arrays weigh ~1 KB, too much to
+     * carve out of the driving thread's stack on every loop turn (and the
+     * cost scales silently with the Kconfig). Safe as shared state because
+     * an instance is driven from a single thread (see myio.h). */
+    struct zsock_pollfd fds[CONFIG_MYIO_MAX_TASKS + 1];
+    z_task  *owner[CONFIG_MYIO_MAX_TASKS + 1];
 #ifdef CONFIG_FILE_SYSTEM
     struct fs_file_t files[CONFIG_MYIO_MAX_FILES];
     uint8_t          file_used[CONFIG_MYIO_MAX_FILES];
@@ -659,23 +671,6 @@ static int write_try(z_task *t) {
     return 0;
 }
 
-/* Unlink `t` from its socket's write FIFO, fixing up head and tail. */
-static void write_list_remove(z_sock *s, z_task *t) {
-    z_task *prev = NULL;
-    for (z_task *c = s->write_head; c; prev = c, c = c->wnext) {
-        if (c != t)
-            continue;
-        if (prev)
-            prev->wnext = c->wnext;
-        else
-            s->write_head = c->wnext;
-        if (s->write_tail == c)
-            s->write_tail = prev;
-        t->wnext = NULL;
-        return;
-    }
-}
-
 /* Drive the socket's head write (which is `t` and not yet on the poll set):
  * send what we can, and if it would block, put it on the poll set for
  * POLLOUT. Each head that finishes is popped, completed, and its successor
@@ -689,20 +684,15 @@ static void write_arm(z_io *z, z_task *t) {
             return;
         }
         /* Pop the head before completing: task_ok/task_err may reap a
-         * detached task, so read t->wnext and advance the FIFO first. */
-        z_sock *s = t->sock;
-        z_task *next = t->wnext;
-        s->write_head = next;
-        if (!next)
-            s->write_tail = NULL;
-        t->wnext = NULL;
+         * detached task, so advance the FIFO first. */
+        myio_wq_node *next = myio_wq_pop(&t->sock->wq);
         if (r == 0)
             task_ok(t, (int64_t)t->len, NULL);
         else
             task_err(t, r);
         if (!next)
             return;
-        t = next; /* arm the next queued write */
+        t = wq_task(next); /* arm the next queued write */
     }
 }
 
@@ -712,18 +702,13 @@ static void write_ready(z_io *z, z_task *t) {
     int r = write_try(t);
     if (r < 0)
         return; /* still blocking; stays on the poll set for the next POLLOUT */
-    z_sock *s = t->sock;
-    z_task *next = t->wnext;
-    s->write_head = next;
-    if (!next)
-        s->write_tail = NULL;
-    t->wnext = NULL;
+    myio_wq_node *next = myio_wq_pop(&t->sock->wq);
     if (r == 0)
         task_ok(t, (int64_t)t->len, NULL);
     else
         task_err(t, r);
     if (next)
-        write_arm(z, next); /* the successor is not yet on the poll set */
+        write_arm(z, wq_task(next)); /* the successor is not yet on the poll set */
 }
 
 static myio_task *impl_sock_write(myio *io, myio_sock *sock, const void *buf,
@@ -736,16 +721,10 @@ static myio_task *impl_sock_write(myio *io, myio_sock *sock, const void *buf,
     t->sock = s;
     t->cbuf = buf;
     t->len = len;
-    t->wnext = NULL;
-    if (s->write_tail) {
-        /* A write is already outstanding: queue behind it with no poll entry
-         * or send attempt until it reaches the head. */
-        s->write_tail->wnext = t;
-        s->write_tail = t;
-    } else {
-        s->write_head = s->write_tail = t;
+    /* A write that lands behind an outstanding one is only queued - no poll
+     * entry or send attempt until it reaches the head. */
+    if (myio_wq_push(&s->wq, &t->wnode))
         write_arm(z, t);
-    }
     return handle_of(t);
 }
 
@@ -769,12 +748,11 @@ static myio_task *impl_sock_close(myio *io, myio_sock *sock) {
     /* Outstanding writes reference the fd about to close; cancel the whole
      * per-socket FIFO (only the head sat on the poll set - task_canceled
      * removes it - but the queued rest must be completed too). */
-    for (z_task *w = s->write_head, *next; w; w = next) {
-        next = w->wnext;
-        w->wnext = NULL;
+    while (s->wq.head) {
+        z_task *w = wq_task(s->wq.head);
+        myio_wq_pop(&s->wq);
         task_canceled(w);
     }
-    s->write_head = s->write_tail = NULL;
     sock_release(z, s);
     task_ok(t, 0, NULL);
     return handle_of(t);
@@ -789,11 +767,7 @@ static int impl_sock_port(myio *io, myio_sock *sock) {
         /* Not every stack can say (offloaded sockets often lack
          * getsockname); fall back to the port the caller bound. */
         return s->port > 0 ? s->port : -1;
-    if (ss.ss_family == AF_INET)
-        return ntohs(((struct sockaddr_in *)&ss)->sin_port);
-    if (ss.ss_family == AF_INET6)
-        return ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
-    return -1;
+    return myio_sockaddr_port(&ss);
 }
 
 /* ---- the loop ---- */
@@ -803,8 +777,8 @@ static int impl_sock_port(myio *io, myio_sock *sock) {
  * then fire expired timers, advance ready socket operations, and harvest
  * off-thread spawn completions. */
 static void run_loop_once(z_io *io) {
-    struct zsock_pollfd fds[CONFIG_MYIO_MAX_TASKS + 1];
-    z_task *owner[CONFIG_MYIO_MAX_TASKS + 1];
+    struct zsock_pollfd *fds = io->fds;
+    z_task **owner = io->owner;
     int n = 0;
     int64_t next_deadline = INT64_MAX;
 
@@ -940,11 +914,11 @@ static int impl_cancel(myio *io, myio_task *task) {
         /* No bytes sent yet (always so for a queued non-head write): unlink
          * it from the socket's write FIFO and cancel it. If it was the head,
          * promote the next queued write onto the poll set. */
-        int was_head = s->write_head == t;
-        write_list_remove(s, t);
+        int was_head = s->wq.head == &t->wnode;
+        myio_wq_remove(&s->wq, &t->wnode);
         task_canceled(t); /* also removes the head's poll entry */
-        if (was_head && s->write_head)
-            write_arm(z, s->write_head);
+        if (was_head && s->wq.head)
+            write_arm(z, wq_task(s->wq.head));
         return 0;
     }
 #ifndef CONFIG_MYIO_SPAWN_INLINE
@@ -1002,16 +976,15 @@ static int impl_task_done(myio *io, const myio_task *task) {
 }
 
 static void impl_task_free(myio *io, myio_task *task) {
-    z_io *z = io_of(io);
     z_task *t = task_of(task);
     if (!t->done) {
         /* The in-flight operation references this memory: cancel if
-         * possible, then drain until completion before releasing it. (A
+         * possible, then step until completion before releasing it. (A
          * pending task is on the pending list, so progress stays possible
          * until it completes.) */
         if (impl_cancel(io, task) != 0)
-            while (!t->done && progress_possible(z))
-                run_loop_once(z);
+            while (!t->done && impl_step(io)) {
+            }
     }
     task_free_mem(t);
 }

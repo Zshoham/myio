@@ -460,13 +460,21 @@ Set `CHAT_RETRY_MS` to shorten the retry interval for testing.
 Implement the `myio_ops` vtable, embed `myio` as the first member of your
 context struct (or return a bare `myio` if you need no state), and provide a
 constructor like `myio *myio_mybackend_new(void)`. See `src/myio_sync.c` for
-the minimal shape. A POSIX C backend can pull the shared boilerplate (result
-constructors, the getaddrinfo error mapping, the connect/listen walks, and the
-local-port and error-string helpers) from the internal `src/myio_common.h`.
+the minimal shape. Two internal headers carry the shared boilerplate:
+
+- `src/myio_common.h` — an OS-neutral core every C backend can use (result
+  constructors, sockaddr→port), plus POSIX-only helpers for desktop
+  backends (the getaddrinfo error mapping, the connect/listen walks, and
+  the local-port and error-string boilerplate).
+- `src/myio_wq.h` — the intrusive FIFO behind the per-socket write
+  serialization the interface promises (only the head write is ever being
+  sent; push tells you when to arm, pop hands you the successor to arm,
+  remove covers cancel/teardown). Any order-preserving backlog fits it.
 
 A backend supplies only the submit operations plus three small primitives:
 `step()` (block until at least one completion has been processed; return 0
-when the loop is drained and no progress is possible), `task_result()` (the
+only when the loop is drained and no progress is possible — never from a
+call that completed a task), `task_result()` (the
 stored result, non-blocking), and `task_done()` (non-blocking completion
 poll). The blocking machinery — `myio_await`, `myio_select`, and everything
 built on them (`myio_join`, `myio_await_all`, `myio_await_timeout`,

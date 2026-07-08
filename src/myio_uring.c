@@ -18,6 +18,7 @@
 #include "myio_uring.h"
 
 #include "myio_common.h"
+#include "myio_wq.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -71,16 +72,25 @@ struct uring_task {
     uring_sock     *sock;    /* op's socket; connect: the not-yet-won sock */
     uring_sock     *newsock; /* accept: wrapper preallocated for the new fd */
     /* Op state the kernel reads asynchronously, so it must live in the task
-     * until the CQE arrives: */
-    char           *path;    /* open */
-    struct __kernel_timespec ts; /* sleep */
-    struct sockaddr_storage addr; /* connect / accept */
-    socklen_t       addrlen;
-    int             wfd;     /* sock_write: fd copy, survives sock teardown */
-    const char     *wbuf;    /* sock_write rearm state */
-    size_t          wlen, wsent;
-    uring_task     *wnext;   /* sock_write: next write queued on the socket */
-    int             wcanceled; /* sock_write: canceled; rearm must not resend */
+     * until the CQE arrives. The kinds are mutually exclusive, so their
+     * state shares a union (connect/accept's sockaddr_storage is what makes
+     * it worth having). `path` stays outside: the task-free paths free it
+     * unconditionally, so it must be a valid pointer for every kind. */
+    char           *path;    /* open: malloc'd copy */
+    union {
+        struct __kernel_timespec ts; /* sleep */
+        struct {                     /* connect / accept */
+            struct sockaddr_storage addr;
+            socklen_t               addrlen;
+        } c;
+        struct {                     /* sock_write */
+            int          wfd;   /* fd copy, survives sock teardown */
+            const char  *wbuf;  /* rearm state */
+            size_t       wlen, wsent;
+            myio_wq_node wnode; /* link in the socket's write FIFO */
+            int          wcanceled; /* canceled; rearm must not resend */
+        } w;
+    } op;
     uring_task     *prev, *next;
 };
 
@@ -94,10 +104,12 @@ struct uring_sock {
      * concurrent sends on one fd, so serializing submissions ourselves is
      * what implements the header's writes-in-submission-order,
      * never-interleaved guarantee). Write tasks point back via t->sock. */
-    uring_task *write_head;
-    uring_task *write_tail;
+    myio_wq     wq;
     uring_sock *prev, *next;
 };
+
+/* The write task whose wnode is `n` (n must be non-NULL). */
+#define wq_task(n) myio_wq_item(n, uring_task, op.w.wnode)
 
 static uring_task *task_of(myio_task *t) { return (uring_task *)t; }
 static myio_task *handle_of(uring_task *t) { return (myio_task *)t; }
@@ -236,7 +248,7 @@ static int write_arm(uring_io *u, uring_task *t) {
     struct io_uring_sqe *sqe = sqe_get(u);
     if (!sqe)
         return -1;
-    io_uring_prep_send(sqe, t->wfd, t->wbuf + t->wsent, t->wlen - t->wsent,
+    io_uring_prep_send(sqe, t->op.w.wfd, t->op.w.wbuf + t->op.w.wsent, t->op.w.wlen - t->op.w.wsent,
                        MSG_WAITALL);
     io_uring_sqe_set_data(sqe, t);
     sqe_flush(u);
@@ -252,17 +264,13 @@ static void write_finish(uring_io *u, uring_task *t, int64_t res) {
     uring_sock *s = t->sock;
     t->sock = NULL;
     if (s) { /* t is the in-flight head by construction */
-        s->write_head = t->wnext;
-        if (!s->write_head)
-            s->write_tail = NULL;
-        t->wnext = NULL;
         /* Promote successors until one's SQE lands or the queue empties. */
-        while (s->write_head && write_arm(u, s->write_head) < 0) {
-            uring_task *n = s->write_head;
-            s->write_head = n->wnext;
-            if (!s->write_head)
-                s->write_tail = NULL;
-            n->wnext = NULL;
+        myio_wq_node *h = myio_wq_pop(&s->wq);
+        while (h) {
+            uring_task *n = wq_task(h);
+            if (write_arm(u, n) == 0)
+                break;
+            h = myio_wq_pop(&s->wq);
             n->sock = NULL;
             task_complete(u, n, -EAGAIN);
         }
@@ -342,8 +350,8 @@ static void dispatch(uring_io *u, uring_task *t, int32_t res) {
             write_finish(u, t, res);
             break;
         }
-        t->wsent += (size_t)res;
-        if (t->wsent < t->wlen) {
+        t->op.w.wsent += (size_t)res;
+        if (t->op.w.wsent < t->op.w.wlen) {
             /* Short send. MSG_WAITALL makes the kernel retry these itself
              * (one CQE per logical write), so this userspace rearm is only
              * the fallback: kernels before 5.19 ignore the flag for send,
@@ -353,7 +361,7 @@ static void dispatch(uring_io *u, uring_task *t, int32_t res) {
              * which case resubmitting would put a new send on a dead or
              * canceled stream; the partial bytes already sent are the
              * header-sanctioned truncation of a canceled write. */
-            if (!t->sock || t->wcanceled) {
+            if (!t->sock || t->op.w.wcanceled) {
                 write_finish(u, t, -ECANCELED);
                 break;
             }
@@ -361,7 +369,7 @@ static void dispatch(uring_io *u, uring_task *t, int32_t res) {
                 write_finish(u, t, -EAGAIN);
             break;
         }
-        write_finish(u, t, (int64_t)t->wlen);
+        write_finish(u, t, (int64_t)t->op.w.wlen);
         break;
     case TASK_SOCK_CLOSE: {
         uring_sock *s = t->sock;
@@ -454,12 +462,12 @@ static myio_task *impl_sleep(myio *io, uint64_t ms) {
     uring_task *t = task_new(u, TASK_SLEEP);
     if (!t)
         return NULL;
-    t->ts.tv_sec = (int64_t)(ms / 1000);
-    t->ts.tv_nsec = (long long)(ms % 1000) * 1000000;
+    t->op.ts.tv_sec = (int64_t)(ms / 1000);
+    t->op.ts.tv_nsec = (long long)(ms % 1000) * 1000000;
     struct io_uring_sqe *sqe = sqe_get(u);
     if (!sqe)
         return task_fail(t, EAGAIN);
-    io_uring_prep_timeout(sqe, &t->ts, 0, 0);
+    io_uring_prep_timeout(sqe, &t->op.ts, 0, 0);
     io_uring_sqe_set_data(sqe, t);
     sqe_flush(u);
     return handle_of(t);
@@ -504,15 +512,14 @@ static myio_task *impl_tcp_connect(myio *io, const char *host, int port) {
     hints.ai_socktype = SOCK_STREAM;
     int rc = getaddrinfo(host, service, &hints, &ai);
     if (rc != 0)
-        /* getaddrinfo's EAI_* codes are negative on glibc; store rc as-is
-         * so a negative result.error is always a resolver code, verbatim
-         * and portable for callers to branch on (see myio.h). EAI_SYSTEM
-         * carries no information of its own - errno has the real cause. */
-        return task_fail(t, rc == EAI_SYSTEM ? errno : rc);
+        /* getaddrinfo's EAI_* codes are negative on glibc; store the code
+         * verbatim so a negative result.error is always a resolver code,
+         * portable for callers to branch on (see myio.h). */
+        return task_fail(t, gai_errno(rc));
     /* Only the first resolved address is tried (the uv backend does the
      * same). The sockaddr must live in the task until the CQE. */
-    memcpy(&t->addr, ai->ai_addr, ai->ai_addrlen);
-    t->addrlen = ai->ai_addrlen;
+    memcpy(&t->op.c.addr, ai->ai_addr, ai->ai_addrlen);
+    t->op.c.addrlen = ai->ai_addrlen;
     int fd = socket(ai->ai_family, SOCK_STREAM, 0);
     freeaddrinfo(ai);
     if (fd < 0)
@@ -528,7 +535,7 @@ static myio_task *impl_tcp_connect(myio *io, const char *host, int port) {
         t->sock = NULL;
         return task_fail(t, EAGAIN);
     }
-    io_uring_prep_connect(sqe, fd, (struct sockaddr *)&t->addr, t->addrlen);
+    io_uring_prep_connect(sqe, fd, (struct sockaddr *)&t->op.c.addr, t->op.c.addrlen);
     io_uring_sqe_set_data(sqe, t);
     sqe_flush(u);
     return handle_of(t);
@@ -594,15 +601,15 @@ static myio_task *impl_tcp_accept(myio *io, myio_sock *listener) {
     t->newsock = sock_new(u, -1);
     if (!t->newsock)
         return task_fail(t, ENOMEM);
-    t->addrlen = sizeof t->addr;
+    t->op.c.addrlen = sizeof t->op.c.addr;
     struct io_uring_sqe *sqe = sqe_get(u);
     if (!sqe) {
         sock_close_now(u, t->newsock);
         t->newsock = NULL;
         return task_fail(t, EAGAIN);
     }
-    io_uring_prep_accept(sqe, ls->fd, (struct sockaddr *)&t->addr,
-                         &t->addrlen, 0);
+    io_uring_prep_accept(sqe, ls->fd, (struct sockaddr *)&t->op.c.addr,
+                         &t->op.c.addrlen, 0);
     io_uring_sqe_set_data(sqe, t);
     sqe_flush(u);
     t->sock = ls;
@@ -639,23 +646,21 @@ static myio_task *impl_sock_write(myio *io, myio_sock *sock, const void *buf,
     uring_task *t = task_new(u, TASK_SOCK_WRITE);
     if (!t)
         return NULL;
-    t->wfd = s->fd;
-    t->wbuf = buf;
-    t->wlen = len;
+    t->op.w.wfd = s->fd;
+    t->op.w.wbuf = buf;
+    t->op.w.wlen = len;
     t->sock = s;
-    if (s->write_head) {
-        /* A write is already outstanding: queue behind it with no SQE of its
-         * own — write_finish arms it when it reaches the head (see the FIFO
-         * comment on uring_sock). */
-        s->write_tail->wnext = t;
-        s->write_tail = t;
+    if (!myio_wq_push(&s->wq, &t->op.w.wnode)) {
+        /* A write is already outstanding: queued behind it with no SQE of
+         * its own — write_finish arms it when it reaches the head (see the
+         * FIFO comment on uring_sock). */
         return handle_of(t);
     }
     if (write_arm(u, t) < 0) {
+        myio_wq_pop(&s->wq); /* t was the sole member; leave the queue empty */
         t->sock = NULL;
         return task_fail(t, EAGAIN);
     }
-    s->write_head = s->write_tail = t;
     return handle_of(t);
 }
 
@@ -701,18 +706,17 @@ static myio_task *impl_sock_close(myio *io, myio_sock *sock) {
      * above); cancel it like the read. The queued rest have no SQE, so no
      * CQE will ever arrive for them: complete them CANCELED right here,
      * through task_complete so detach/reap semantics hold. */
-    if (s->write_head) {
-        uring_task *w = s->write_head;
+    if (s->wq.head) {
+        uring_task *w = wq_task(s->wq.head);
         cancel_submit(u, w);
         w->sock = NULL;
-        for (uring_task *q = w->wnext, *qn; q; q = qn) {
-            qn = q->wnext;
-            q->wnext = NULL;
+        myio_wq_pop(&s->wq); /* the head's own CQE settles it */
+        while (s->wq.head) {
+            uring_task *q = wq_task(s->wq.head);
+            myio_wq_pop(&s->wq);
             q->sock = NULL;
             task_complete(u, q, -ECANCELED);
         }
-        w->wnext = NULL;
-        s->write_head = s->write_tail = NULL;
     }
     struct io_uring_sqe *sqe = sqe_get(u);
     if (!sqe)
@@ -763,18 +767,12 @@ static int impl_cancel(myio *io, myio_task *task) {
         break;
     case TASK_SOCK_WRITE: {
         uring_sock *s = t->sock;
-        if (s && s->write_head != t) {
+        if (s && s->wq.head != &t->op.w.wnode) {
             /* Queued behind an earlier write: it has no SQE, hence no kernel
              * state to unwind — unlink it from the FIFO and complete it
              * CANCELED on the spot. This keeps task_free on a queued write
              * non-blocking. */
-            uring_task *prev = s->write_head;
-            while (prev->wnext != t)
-                prev = prev->wnext;
-            prev->wnext = t->wnext;
-            if (s->write_tail == t)
-                s->write_tail = prev;
-            t->wnext = NULL;
+            myio_wq_remove(&s->wq, &t->op.w.wnode);
             t->sock = NULL;
             task_complete(u, t, -ECANCELED);
             return 0;
@@ -786,7 +784,7 @@ static int impl_cancel(myio *io, myio_task *task) {
          * resubmitting a send the cancel can no longer find. */
         if (cancel_submit(u, t) < 0)
             return -1;
-        t->wcanceled = 1;
+        t->op.w.wcanceled = 1;
         break;
     }
     default:
@@ -865,18 +863,16 @@ static void impl_destroy(myio *io) {
      * head's sock pointer keeps its -ECANCELED CQE from promoting a queued
      * write onto the ring in the middle of the drain below. */
     for (uring_sock *s = u->socks; s; s = s->next) {
-        if (!s->write_head)
+        if (!s->wq.head)
             continue;
-        uring_task *w = s->write_head;
-        w->sock = NULL;
-        for (uring_task *q = w->wnext, *qn; q; q = qn) {
-            qn = q->wnext;
-            q->wnext = NULL;
+        wq_task(s->wq.head)->sock = NULL;
+        myio_wq_pop(&s->wq); /* the head's -ECANCELED CQE settles it */
+        while (s->wq.head) {
+            uring_task *q = wq_task(s->wq.head);
+            myio_wq_pop(&s->wq);
             q->sock = NULL;
             task_complete(u, q, -ECANCELED);
         }
-        w->wnext = NULL;
-        s->write_head = s->write_tail = NULL;
     }
     /* Request cancellation of everything still in flight, then drain until
      * the kernel has delivered every CQE. Closing the ring fd would cancel

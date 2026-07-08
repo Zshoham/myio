@@ -1,5 +1,34 @@
 # Review pass over the API-hardening round (commits ccab740...HEAD)
 
+**FIX ROUND COMPLETE (2026-07-05, uncommitted in the working tree).**
+Everything below was implemented except the two items marked optional:
+finding 9 (zephyr_pool nqueued, kept as an explicit invariant) and
+follow-up D (dropping task_done from the vtable). What landed:
+
+- **A + findings 12/10/11:** step() re-specified ("a call that completes a
+  task must not return 0"); uv/xev grew an `ncompleted` counter in their
+  completion funnels; the generic await/select re-poll branches are gone;
+  the uv/xev/zephyr drain loops now call impl_step; the stale zephyr top
+  comment is fixed. README "Adding a backend" updated.
+- **B + finding 13:** new OS-include-free `src/myio_wq.h` (push/pop/remove
+  intrusive FIFO); adopted by uring, zephyr, pool, zephyr_pool; the Zig
+  backend mirrors the shape with writePush/writePopHead/writeListRemove.
+- **C + finding 15:** xev routes len==0 writes through the FIFO; the
+  ordering paragraph in myio.h says zero-length writes take their turn;
+  regression test added (fails on the old xev shortcut).
+- **Findings 1/2:** pool + zephyr_pool rewired to dispatch only the FIFO
+  head to a worker; non-head writes are parked (no worker, no queue slot)
+  and promoted by write_advance on the head's completion. The done_cv
+  write-turn wait is gone (the write-turn share of finding 2; step() and
+  close-drain remain the only waiters). Verified by a thread-count probe:
+  32 congested writes on one socket = 4 threads (was ~34).
+- **Findings 5/6/7/8:** memcmp verify; uring uses gai_errno(); shared
+  examples/test_common.h; myio_await_timeout calls myio_task_drop.
+
+Verified green: `make test` (13 desktop invocations), 5x stress on all
+four async desktop backends (concurrency + cancel), and `make test-zephyr`
+(both Zephyr backends on native_sim).
+
 Second-pass review (high effort, 8 finder angles + verification) over the
 three commits: write-serialization FIFOs + io_uring close-vs-write fix,
 EAI_* error convention, step()/task_result() vtable refactor, myio_caps(),
@@ -229,6 +258,275 @@ before ever calling step, so no missed wakeup).
 ### Conventions
 
 None — no CLAUDE.md files exist in the repo or user scope.
+
+## Architectural follow-ups (interface-level)
+
+Third pass: re-read include/myio.h (vtable + generic loops) and
+myio_common.h against the findings above, asking which interface decisions
+would remove whole *classes* of these problems instead of patching
+instances. Verified the enabling preconditions in the code (completion
+funnels, per-backend step() shapes) before recommending.
+
+### A. Re-specify step(): a call that completes a task must not return 0
+(root-fixes 12, unlocks 10)
+
+The current contract lets uv/xev return 0 on the very turn that processes
+the final completion, so the generic await/select carry permanent
+compensating re-poll branches (include/myio.h:389-392, :460-463) and any
+future direct vtable consumer is a landmine. Five of seven backends
+already conform: pool/zephyr_pool via their completions/comp_seen
+generation counter, zephyr because it checks progress_possible *before*
+running the turn (myio_zephyr.c:894-899), uring because its step drains
+CQEs, sync because its step is never reached. Only uv and xev forward the
+"loop still alive" flag.
+
+The fix is small because both violators funnel every completion through
+one function (task_finish at src/myio_uv.c:107, finish at
+src/myio_xev.zig:263): add an `ncompleted` counter to the io struct,
+bump it in the funnel, and step() becomes "capture counter; run once;
+return alive || counter advanced". Then:
+
+- the two re-poll branches in the header's generic loops are deleted and
+  the EDEADLK path becomes directly trustworthy;
+- finding 10's drain loops can legally collapse onto the primitive:
+  `while (!t->done && impl_step(io))` becomes correct in all three
+  backends that currently re-inline divergent step bodies (uv:688,
+  zephyr:1013, xev:1148) — the "not clean swaps" caveat in finding 10
+  exists only because the current contract is too weak.
+
+This is the one change that makes the *documented* interface the thing
+backends actually implement.
+
+### B. Shared intrusive write-FIFO helper (fixes 13, prevents 15-class
+drift)
+
+The ordering contract's trickiest mechanics — tail push, head pop +
+successor promote, arbitrary remove with tail fixup — are hand-copied in
+four C backends plus once in Zig, each over its own task type; finding 15
+(xev's len==0 bypass) is exactly the drift this invites. Extract a
+type-neutral intrusive queue: a `myio_wq_node { next }` embedded in each
+task struct, `myio_wq { head, tail }` in each sock, container_of to
+recover the task. Three operations:
+
+- `wq_push(q, n) -> int became_head` — the "arm the send now" signal.
+  Making push the only entrance turns "every write takes its turn"
+  into the path of least resistance; a len==0 shortcut becomes a
+  deliberate deviation instead of an easy accident.
+- `wq_pop_head(q) -> new_head` — completion-side promote (the
+  write_finish loop shape at myio_uring.c:251).
+- `wq_remove(q, n) -> int found` — cancel/teardown unlink, with the
+  tail fixup written exactly once.
+
+Placement: NOT myio_common.h as it stands — that header is POSIX-only by
+charter and drags in netdb/arpa, which is why the Zephyr backends
+deliberately cannot include it. Either a new OS-include-free
+`src/myio_wq.h` usable by all five C backends, or split myio_common.h
+into an OS-neutral core plus a POSIX section. The Zig copy stays separate
+(different type system) but should mirror the same three-op shape so the
+disciplines stay recognizably identical across languages.
+
+### C. Decide zero-length-write ordering in the header, not per backend
+(settles 15)
+
+Recommend routing len==0 through the FIFO (i.e. change xev to match the
+other five) and adding one sentence to the ordering paragraph
+(include/myio.h:308) — "zero-length writes take their turn like any
+other" — rather than carving an exception into the contract. Uniformity
+across seven backends is worth more than one backend's micro-shortcut.
+
+### D. Optional: drop task_done from the vtable
+
+task_result is already required to return status MYIO_PENDING before
+completion (include/myio.h:225), so `task_done(t)` is derivable as
+`task_result(t).status != MYIO_PENDING`. Removing it is one less function
+per backend (x7) and one less field to keep in ABI sync in the Zig Ops
+mirror; the public myio_task_done() wrapper stays, implemented on
+task_result. Cost: the generic loops' hot poll returns a small struct
+instead of an int — noise. Only worth folding in if the vtable is being
+touched anyway (it is, if A lands).
+
+### E. Deliberate non-changes
+
+- **Findings 1 and 2 are pool implementation strategy, not interface.**
+  The interface already permits the fix (leave non-head writes
+  undelivered in the task queue until promoted). Resist the tempting
+  interface "fix" of capping outstanding writes per socket like the
+  one-read rule: the header's own rationale (include/myio.h:349-359,
+  partial-write composition) is why the ordering guarantee exists;
+  capping just exports the FIFO to every caller.
+- **Findings 3 and 4 stay accepted costs.** If profiling ever disagrees,
+  the escape hatch is optional vtable fast-path entries (NULL = fall
+  back to the generic loop). Note the pattern; do not add it now.
+- **A generic write-serialization layer above the vtable does not fit**
+  this interface: sockets are opaque backend types, the header has no
+  completion hook (by the re-entrancy design), and the wrappers are
+  submit-time-only. Per-backend FIFOs sharing the list mechanics (B) is
+  the right altitude.
+- Finding 8 (myio_await_timeout should call myio_task_drop) is a
+  header-local cleanup to fold into the same edit as A/C.
+
+Suggested order: A (contract), then C + 15's xev change, then B
+(mechanical adoption in four backends), with D and the finding-8 cleanup
+riding along on the header edit. Findings 1/2/5/6/7/9/11 proceed
+independently as the per-backend fixes already described above.
+
+## Performance / code-quality pass (2026-07-05, post-fix-round)
+
+Focused on allocations, struct footprints, stack usage, and algorithmic
+complexity. Struct sizes measured (x86-64, sizeof probes; xev via
+@compileLog), syscall counts via strace, scheduling via perf stat.
+
+### Measured footprints
+
+| struct       | size | dominated by |
+|--------------|------|--------------|
+| pool_task    | 176 B | flat op args (fine) |
+| uring_task   | 288 B | sockaddr_storage 128 B (connect/accept only) |
+| uv_task      | 656 B | union sized by uv_fs_t 440 B (timer needs 152, write 192, work 128) |
+| xev Task     | 760 B (io_uring) / 592 B (epoll) | three embedded xev.Completion (184/128 B each) |
+| uv_sock      | 304 B | uv_tcp_t (inherent) |
+
+### Findings, ranked
+
+**Implementation status (same day):** findings 1-3 are implemented and
+verified (details inline below); 4-6 stay as documented non-changes.
+- (1) uv: the request union became a flexible-array tail (`union uv_req
+  u[]`), task_new allocates per kind - a sleep task went 656->368 B, a
+  socket read/accept/close 656->216 B; the FAM keeps -Warray-bounds
+  honest where a plain short calloc would not. uring: op state (sleep ts,
+  connect/accept sockaddr, the sock_write group incl. its wq node) now
+  shares a `union op` - 288->232 B. xev: measured but deliberately NOT
+  slimmed - the pool-stage fields (c_async, notifier, pool_*) appear at
+  34 sites including taskIdle, the memory-reclaim gate; a nullable side
+  allocation there buys ~230 B/task at the cost of destabilizing the
+  trickiest lifetime code in the tree. Deferred with this shape on file.
+- (2) zephyr: run_loop_once's fds[]/owner[] arrays moved into z_io (a
+  static singleton; single-driver rule makes that race-free) - the
+  driving thread's per-turn stack cost is gone.
+- (3) pool: workers are now detached, park on work_cv with a
+  CLOCK_MONOTONIC pthread_cond_timedwait, and retire after POOL_IDLE_SEC
+  (10 s) without work; destroy waits for a live-count to hit zero instead
+  of joining, and the threads[] array is gone. Verified live: 4 threads
+  during a 32-write burst, 2 after 11.5 s idle. The retire-vs-dispatch
+  race is closed by re-checking qhead under the mutex after a timeout.
+
+1. **Task structs pay the worst-case op's footprint on every allocation.**
+   Every uv sleep task carries the 440-byte uv_fs_t; every uring task the
+   128-byte sockaddr_storage only connect/accept use. Fix shapes: uv's
+   union is the LAST member, so task_new(kind) can malloc the true size
+   per kind (timer 656→368); uring can fold the mutually exclusive
+   op-state fields (addr/addrlen, ts, path, the w* write group) into a
+   union (~150 B saved). xev is harder (one comptime struct, fixed
+   Completions - c_async is only needed by thread-pool stage ops); accept
+   or split per kind later. Modest, low-risk memory/cache win.
+
+2. **myio_zephyr.c run_loop_once carves ~1 KB off the driving thread's
+   stack every turn** (`fds[CONFIG_MYIO_MAX_TASKS+1]` + matching `owner[]`
+   pointer array = ~1040 B at the default 64; scales linearly with the
+   Kconfig). On RTOS-sized stacks this is the largest stack consumer in
+   the backend, and it grows silently when MAX_TASKS is raised. Fix:
+   move both arrays into z_io - the header's single-driving-thread rule
+   makes an instance buffer race-free, and z_io is a static singleton, so
+   it trades stack risk for predictable static RAM.
+
+3. **The desktop pool never reaps idle workers** (documented design:
+   spawn on demand, join only at destroy). A burst of N concurrently
+   blocking ops leaves N parked threads (default 8 MB stack VMA each)
+   for the instance's lifetime. Fix shape: pthread_cond_timedwait in
+   worker_main's idle park; exit after an idle timeout when idle >
+   some floor. Worth doing for long-lived processes; not urgent for the
+   examples.
+
+4. **One-to-two heap allocations (calloc) per submitted task, no reuse**
+   (uv/uring/pool/sync; xev via c_allocator). A hot request loop is
+   malloc-bound before it is IO-bound only in theory - not visible in
+   perf on the test workloads - so defer, consistent with the earlier
+   deferral of tagged-pointer error tasks. Fix shape if ever needed: a
+   small capped per-instance LIFO freelist in task_new/task free paths.
+   (Related existing cost, kept: failed submissions allocate a task just
+   to carry EBUSY/EAGAIN/ENAMETOOLONG.)
+
+5. **uv one-shot reads flip read_start/read_stop per sock_read** (epoll
+   watcher churn inside libuv). Inherent to adapting uv's push API to
+   the pull model with at-most-one-outstanding-read; accepted.
+
+6. **uring pays one io_uring_enter per submit** - measured: 98 enter
+   calls for the entire concurrency_test run, ~102 us/call. Required by
+   the eager-submission contract (the op must be executing when submit
+   returns); SQPOLL is the escape hatch if a real workload ever cares.
+
+### Verified clean (no findings)
+
+- myio_wq: push/pop O(1); remove O(n) only on cancel/close/teardown
+  paths. Pool queue_remove likewise O(n) on rare paths only.
+- uring's task registry is doubly linked (O(1) unlink per completion);
+  socket registry likewise.
+- No oversized on-stack objects in the POSIX backends (largest:
+  sockaddr_storage 128 B, instance errbufs are in the io struct).
+- myio_result by value (32 B) across the vtable: negligible.
+- Post-rewrite done_cv fan-out is small (user thread + close-drain
+  workers only); the write-turn share of the old broadcast storm is gone.
+- Generic await/select vtable-call overhead: already documented as
+  accepted costs (findings 3/4 above), unchanged by this pass.
+- perf stat on concurrency_test pool: dominated by user-space buffer
+  work (memset/memcmp of the 15 MB test buffers), not scheduling or
+  locking - the mutex-per-task_done cost of the generic loops is real
+  but invisible at these op rates.
+
+## Code-quality / extraction pass (2026-07-06)
+
+Goal: interface polish, backend cleanups, and extracting the patterns a
+future backend would otherwise re-invent. All implemented and verified
+(make test clean, 3x stress on the four async desktop backends,
+make test-zephyr green).
+
+### Extractions (easing backend #8)
+
+- **myio_common.h restructured into an OS-neutral core + POSIX section.**
+  The core (result constructors r_ok/r_err/r_canceled/r_from and a new
+  `myio_sockaddr_port`) now serves every C backend including the Zephyr
+  pair (`#ifdef __ZEPHYR__` include fencing). Consequences: zephyr_pool's
+  local copies of the result constructors are gone (the T6 leftovers),
+  and the sockaddr->port family switch that existed in four places
+  (myio_local_port, uv, zephyr, zephyr_pool) exists once; uv now includes
+  the common core too.
+- **myio_wq generalized beyond writes.** libuv's accepted-but-unclaimed
+  connection queue (pending_head/pending_tail/next_pending - a third
+  hand-rolled FIFO shape) now rides on myio_wq; header doc updated to
+  frame wq as "the intrusive FIFO, defining job the write queue".
+- **pool gained complete_unrun()** (the helper zephyr_pool already had):
+  the queued-or-parked "complete CANCELED on the spot" logic previously
+  hand-inlined at four sites (impl_cancel, impl_task_free, sock_close's
+  parked sweep, destroy's queue drop + parked sweep) is one function; the
+  two pool backends read structurally identical again.
+- **sync's three task constructors collapsed** onto one task_res(result)
+  wrapper reusing the common r_* constructors.
+- **README "Adding a backend"** now lists both internal helper headers and
+  what each provides.
+
+### Interface polish (myio.h)
+
+- Intro no longer advertises a "stackful/stackless coroutines" backend
+  that does not exist; it names the real mechanism family.
+- task_done's vtable doc states the agreement requirement with
+  task_result (done <=> stored status != MYIO_PENDING).
+- myio_select's -1 is documented as the select analogue of await's
+  EDEADLK (sharpened for the strengthened step() contract).
+- myio_await_all: misleading `all_ok` local (0 meant ok, -1 not) renamed
+  and the loop tightened.
+
+### Considered and rejected
+
+- **A lock-shim to merge pool and zephyr_pool** (macros over pthread vs
+  k_mutex/k_condvar): would merge ~2x700 lines into one file of
+  preprocessor indirection; the pair's readability comes precisely from
+  each being idiomatic for its platform. complete_unrun/write_advance
+  parity is the intended amount of sharing.
+- **A macro generating the task_of/handle_of/io_of/sock_of casts** per
+  backend: four one-line casts do not justify macro-generated functions.
+- **Sharing the connect/listen walks with Zephyr** via symbol-prefix
+  macros (zsock_socket vs socket): the walks differ in error detail and
+  the macro layer would cost more than the ~40 duplicated lines.
 
 ## Carried over / out of scope
 

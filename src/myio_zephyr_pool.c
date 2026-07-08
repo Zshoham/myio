@@ -25,24 +25,30 @@
  *   in-task copy of open's path / connect's host (CONFIG_MYIO_STR_MAX;
  *   longer strings fail the submission with ENAMETOOLONG).
  *
- * Writes on one socket are serialised through a per-socket FIFO (write_head/
- * write_tail, linked by wnext, in submission order), exactly as the desktop
- * pool does: the worker running a write waits on done_cv until its task
- * reaches the head, then sends, so the bytes of overlapping writes never
- * interleave on the wire.
+ * Writes on one socket are serialised through a per-socket FIFO (a myio_wq,
+ * see src/myio_wq.h), exactly as the desktop pool does: only the FIFO head
+ * is ever handed to a worker; the rest are parked on the FIFO - occupying
+ * no worker and no queue slot - until the head's completion promotes and
+ * queues the next in line (write_advance). This matters doubly here: the
+ * worker count is FIXED, so writes waiting their turn on workers could
+ * permanently starve every other operation.
  *
  * Cancellation follows the desktop pool: a queued task is lifted out; a
  * running sleep, accept or socket read wakes through the eventfd and
- * reports MYIO_CANCELED; a socket write still waiting its turn behind an
- * earlier write cancels too (no bytes on the wire yet); a running connect,
- * file op, the socket write actually sending, or a spawned function refuses.
- * sock_close marks the socket closing, kicks every blocked op on it and wakes
- * writers waiting their turn (they report CANCELED), and a close worker waits
- * for them to drain before closing the fd. zsock_shutdown() is issued
- * best-effort to also wake a blocked send - the offloaded-sockets driver
- * does not implement it, so there the kick is what does the waking.
+ * reports MYIO_CANCELED; a socket write parked behind an earlier write has
+ * no worker and no bytes on the wire yet, so it cancels like a queued task;
+ * a running connect, file op, the socket write actually sending, or a
+ * spawned function refuses. sock_close marks the socket closing, kicks
+ * every blocked op on it, completes parked writes CANCELED itself, and a
+ * close worker waits for the rest to drain before closing the fd.
+ * zsock_shutdown() is issued best-effort to also wake a blocked send - the
+ * offloaded-sockets driver does not implement it, so there the kick is what
+ * does the waking.
  */
 #include "myio_zephyr_pool.h"
+
+#include "myio_common.h"
+#include "myio_wq.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -96,11 +102,11 @@ struct zp_sock {
     int      inflight;    /* read/write/accept ops touching this fd */
     zp_task *read_task;   /* outstanding sock_read (at most one) */
     zp_task *accept_task; /* outstanding tcp_accept (at most one) */
-    /* Outstanding sock_writes, FIFO in submission order. A write's worker
-     * only sends once its task reaches write_head; the rest wait on done_cv,
-     * so overlapping writes never interleave on the wire. */
-    zp_task *write_head;
-    zp_task *write_tail;
+    /* Outstanding sock_writes, FIFO in submission order. Only the head is
+     * ever dispatched to a worker; the rest are parked here until
+     * write_advance promotes them, so overlapping writes never interleave
+     * on the wire. */
+    myio_wq  wq;
     zp_sock *next;
 };
 
@@ -127,8 +133,11 @@ struct zp_task {
     zp_worker      *worker;     /* worker running it, valid once started */
     myio_result     res;
     zp_task        *qnext;      /* work-queue link */
-    zp_task        *wnext;      /* sock_write: per-socket write FIFO link */
+    myio_wq_node    wnode;      /* sock_write: link in the socket's write FIFO */
 };
+
+/* The write task whose wnode is `n` (n must be non-NULL). */
+#define wq_task(n) myio_wq_item(n, zp_task, wnode)
 
 struct zp_worker {
     struct k_thread thread;
@@ -175,21 +184,6 @@ K_THREAD_STACK_ARRAY_DEFINE(zp_stacks, CONFIG_MYIO_POOL_WORKERS,
 
 static zp_io *io_of(myio *io) { return (zp_io *)io; }
 static zp_task *task_of(myio_task *t) { return (zp_task *)t; }
-
-/* ---- result constructors ---- */
-
-static myio_result r_ok(int64_t value, void *ptr) {
-    myio_result r = { MYIO_OK, value, 0, ptr };
-    return r;
-}
-static myio_result r_err(int err) {
-    myio_result r = { MYIO_ERROR, 0, err, NULL };
-    return r;
-}
-static myio_result r_canceled(void) {
-    myio_result r = { MYIO_CANCELED, 0, 0, NULL };
-    return r;
-}
 
 /* ---- socket list (all calls hold io->mu) ---- */
 
@@ -264,40 +258,33 @@ static void sock_slots_clear(zp_task *t) {
 
 /* ---- per-socket write FIFO (all calls hold io->mu) ---- */
 
-static void write_enqueue(zp_sock *s, zp_task *t) {
-    t->wnext = NULL;
-    if (s->write_tail)
-        s->write_tail->wnext = t;
-    else
-        s->write_head = t;
-    s->write_tail = t;
-}
-
-static void write_dequeue(zp_sock *s, zp_task *t) {
-    zp_task *prev = NULL;
-    for (zp_task *c = s->write_head; c; prev = c, c = c->wnext) {
-        if (c != t)
-            continue;
-        if (prev)
-            prev->wnext = c->wnext;
-        else
-            s->write_head = c->wnext;
-        if (s->write_tail == c)
-            s->write_tail = prev;
-        t->wnext = NULL;
+/* The write `t` is leaving its socket's FIFO (completed, canceled, or
+ * dropped): unlink it, and if it was the head, queue the next parked write
+ * for a worker. Nothing is promoted during teardown: impl_destroy completes
+ * every parked write itself, and a queued op must never start once shutdown
+ * began. Caller holds io->mu. */
+static void write_advance(zp_io *p, zp_task *t) {
+    zp_sock *s = t->sock;
+    if (s->wq.head != &t->wnode) {
+        myio_wq_remove(&s->wq, &t->wnode); /* parked: no successor to arm */
         return;
     }
+    myio_wq_node *h = myio_wq_pop(&s->wq);
+    if (!h || p->shutdown)
+        return;
+    queue_push(p, wq_task(h));
+    k_condvar_signal(&p->work_cv);
 }
 
-/* Complete a task that never ran (canceled while queued, or dropped at
- * destroy). Caller holds io->mu. */
+/* Complete a task that never ran (canceled while queued or parked, or
+ * dropped at destroy). Caller holds io->mu. */
 static void complete_unrun(zp_io *p, zp_task *t, myio_result res) {
     queue_remove(p, t);
     if (op_on_sock(t->kind)) {
         t->sock->inflight--;
         sock_slots_clear(t);
         if (t->kind == OP_SOCK_WRITE)
-            write_dequeue(t->sock, t);
+            write_advance(p, t);
     }
     t->res = res;
     t->done = 1;
@@ -546,15 +533,13 @@ static void worker_run(zp_task *t) {
         }
         break;
     case OP_SOCK_WRITE: {
-        /* Wait for this write's turn: only the FIFO head sends, so the bytes
-         * of overlapping writes never interleave on the wire. Bail out
-         * without sending if the socket is closing/tearing down or the wait
-         * was canceled - the commit below reports CANCELED. */
+        /* Dispatched only as its socket's FIFO head (by submit or
+         * write_advance), so this write owns the wire already - no turn to
+         * wait for. Bail out without sending if the socket began closing
+         * (or the pool is tearing down) between dispatch and pickup - the
+         * commit below reports CANCELED. */
         k_mutex_lock(&p->mu, K_FOREVER);
-        while (t->sock->write_head != t && !t->sock->closing &&
-               !p->shutdown && !t->cancel_req)
-            k_condvar_wait(&p->done_cv, &p->mu, K_FOREVER);
-        int stop = t->sock->closing || p->shutdown || t->cancel_req;
+        int stop = t->sock->closing || p->shutdown;
         k_mutex_unlock(&p->mu);
         if (stop) {
             res = r_canceled();
@@ -607,7 +592,7 @@ commit:
         t->sock->inflight--;
         sock_slots_clear(t);
         if (t->kind == OP_SOCK_WRITE)
-            write_dequeue(t->sock, t); /* let the next queued write take over */
+            write_advance(p, t); /* queue the next parked write for a worker */
         if (t->sock->closing) {
             /* A connection accepted just as the listener closed is dropped. */
             if (res.ptr) {
@@ -693,8 +678,13 @@ static myio_task *submit(zp_task *t) {
     k_mutex_lock(&p->mu, K_FOREVER);
     if (op_on_sock(t->kind))
         t->sock->inflight++;
-    if (t->kind == OP_SOCK_WRITE)
-        write_enqueue(t->sock, t); /* submission-order turn, under the lock */
+    if (t->kind == OP_SOCK_WRITE && !myio_wq_push(&t->sock->wq, &t->wnode)) {
+        /* Behind an outstanding write: parked on the socket's FIFO, with no
+         * queue slot and no worker, until write_advance queues it at its
+         * turn. */
+        k_mutex_unlock(&p->mu);
+        return (myio_task *)t;
+    }
     queue_push(p, t);
     k_condvar_signal(&p->work_cv);
     k_mutex_unlock(&p->mu);
@@ -913,6 +903,11 @@ static myio_task *impl_sock_close(myio *io, myio_sock *sock) {
             worker_kick(c);
         }
     }
+    /* Writes parked behind the FIFO head have no worker and will never get
+     * one now: complete them CANCELED right here. The head (sending, or
+     * queued and about to see `closing`) is left to its worker. */
+    while (s->wq.head && s->wq.head->next)
+        complete_unrun(p, wq_task(s->wq.head->next), r_canceled());
     if (s->inflight == 0) {
         /* Nothing blocked on the socket: close right here, no worker
          * needed. */
@@ -926,9 +921,7 @@ static myio_task *impl_sock_close(myio *io, myio_sock *sock) {
         return (myio_task *)t;
     }
     /* The shutdown is best-effort: it wakes a blocked send where the stack
-     * supports it (the offloaded-sockets driver does not implement it). The
-     * broadcast wakes writers still waiting their turn on done_cv, which see
-     * `closing` and complete CANCELED without sending. */
+     * supports it (the offloaded-sockets driver does not implement it). */
     zsock_shutdown(s->fd, ZSOCK_SHUT_RDWR);
     k_condvar_broadcast(&p->done_cv);
     queue_push(p, t);
@@ -946,19 +939,17 @@ static int impl_sock_port(myio *io, myio_sock *sock) {
         /* Not every stack can say (offloaded sockets often lack
          * getsockname); fall back to the port the caller bound. */
         return s->port > 0 ? s->port : -1;
-    if (ss.ss_family == AF_INET)
-        return ntohs(((struct sockaddr_in *)&ss)->sin_port);
-    if (ss.ss_family == AF_INET6)
-        return ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
-    return -1;
+    return myio_sockaddr_port(&ss);
 }
 
 /* ---- synchronisation and lifetime ---- */
 
 /* Report progress: a worker completion the user thread has not yet seen,
- * or failing that, wait for the next one. Every pending task is either
- * queued or running (nqueued + nrunning > 0), so 0 - no progress possible -
- * is only ever returned when nothing is outstanding at all. The generation
+ * or failing that, wait for the next one. Every pending task is queued or
+ * running - or a parked write, whose socket's FIFO head is itself queued or
+ * running (write_advance keeps that invariant) - so nqueued + nrunning > 0
+ * covers them all, and 0 - no progress possible - is only ever returned
+ * when nothing is outstanding at all. The generation
  * check makes step() immune to the check-then-wait race: a completion that
  * landed after the caller's last task_done poll is reported immediately
  * instead of sleeping through its (already spent) broadcast. A spurious 1
@@ -986,23 +977,18 @@ static int impl_cancel(myio *io, myio_task *task) {
     if (t->done) {
         rc = -1;
     } else if (!t->started) {
-        /* Still queued: lift it straight out. */
+        /* Still queued - or a write parked on its socket's FIFO, which no
+         * worker has either: lift it straight out. Removing a dispatched
+         * FIFO head promotes the next parked write in its place. */
         complete_unrun(p, t, r_canceled());
         rc = 0;
     } else if (op_interruptible(t->kind)) {
         /* Running inside a cancelable wait: flag it and kick the worker.
          * The worker reports the outcome (canceled, unless it already
-         * completed in the meantime). */
+         * completed in the meantime). A started sock_write is the sending
+         * FIFO head and refuses, like any running blocking call. */
         t->cancel_req = 1;
         worker_kick(t);
-        rc = 0;
-    } else if (t->kind == OP_SOCK_WRITE && t->sock->write_head != t) {
-        /* A write still waiting its turn behind an earlier write: no bytes on
-         * the wire yet, so it can still be canceled. Flag it and wake it; the
-         * worker completes it CANCELED and pops the FIFO. (The head write is
-         * already sending and refuses, like any running blocking call.) */
-        t->cancel_req = 1;
-        k_condvar_broadcast(&p->done_cv);
         rc = 0;
     }
     k_mutex_unlock(&p->mu);
@@ -1051,18 +1037,15 @@ static void impl_task_free(myio *io, myio_task *task) {
     k_mutex_lock(&p->mu, K_FOREVER);
     if (!t->done) {
         if (!t->started) {
+            /* Still queued (or a parked write): cancel it outright. */
             complete_unrun(p, t, r_canceled());
         } else {
             /* Running: the worker references this memory, so wait it out -
              * but first ask an interruptible op to stop, or the wait could
-             * be unbounded (a read with no data ever coming, or a write still
-             * waiting its turn behind a stalled peer). */
+             * be unbounded (a read with no data ever coming). */
             if (op_interruptible(t->kind)) {
                 t->cancel_req = 1;
                 worker_kick(t);
-            } else if (t->kind == OP_SOCK_WRITE && t->sock->write_head != t) {
-                t->cancel_req = 1;
-                k_condvar_broadcast(&p->done_cv);
             }
             while (!t->done)
                 k_condvar_wait(&p->done_cv, &p->mu, K_FOREVER);
@@ -1099,6 +1082,22 @@ static void impl_destroy(myio *io) {
         complete_unrun(p, t, r_canceled());
         if (owned)
             reap(t); /* destroy owns what the caller abandoned */
+    }
+    /* Writes parked behind a head some worker is still sending are on no
+     * queue any worker will reach (and write_advance promotes nothing once
+     * shutdown is set): complete them CANCELED here. */
+    for (zp_sock *s = p->socks; s; s = s->next) {
+        myio_wq_node *h = s->wq.head;
+        if (h && wq_task(h)->started)
+            h = h->next; /* the running head is the worker's to finish */
+        while (h) {
+            zp_task *w = wq_task(h);
+            h = h->next;
+            int owned = !w->detached;
+            complete_unrun(p, w, r_canceled());
+            if (owned)
+                reap(w);
+        }
     }
     /* Cancel every interruptible op a worker is still blocked in; what
      * cannot be canceled (a spawn, a blocked send) is waited out. The
